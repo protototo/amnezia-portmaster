@@ -283,6 +283,210 @@ def validate_port_range(port_range_str, used_ports):
         return False
 
 
+def get_mounted_volumes(ssh_client, container_name):
+    """
+    Retrieves the mounted volumes of a Docker container via SSH using docker inspect.
+
+    Args:
+        ssh_client: A paramiko SSHClient object connected to the remote host.
+        container_name: The name of the Docker container.
+
+    Returns:
+        A list of dictionaries, where each dictionary represents a mount.
+        Returns an empty list if there are no mounts or an error occurs.
+    """
+
+    try:
+        _, stdout, stderr = ssh_client.exec_command(
+            f"docker inspect {container_name}")
+        exit_code = stdout.channel.recv_exit_status()
+        if exit_code != 0:
+            print(f"Error inspecting container: {stderr.read().decode()}")
+            return []  # Return empty list on error
+
+        inspect_output = stdout.read().decode()
+        container_info = json.loads(inspect_output)
+
+        # Handle cases where docker inspect returns an empty list (container not found)
+        if not container_info:
+            print(f"Container '{container_name}' not found.")
+            return []
+
+        # Get Mounts or empty list if not present
+        mounts = container_info[0].get("Mounts", [])
+        return mounts
+
+    except (paramiko.SSHException, json.JSONDecodeError) as e:
+        print(f"An error occurred: {e}")
+        return []  # Return an empty list in case of exception
+
+def prepare_payload_wg(ssh, container_name, port_range, tcp_ports, udp_ports):
+    """Downloads files from the container, modifies them, and saves them in PAYLOAD_DIR.
+
+    Args:
+        ssh (paramiko.SSHClient): SSH connection object.
+        container_name (str): Container name.
+        port_range (str): Port range for portmaster.
+        tcp_ports (list): List of container TCP ports.
+        udp_ports (list): List of container UDP ports. 
+    """
+    AMNEZIA_DIR = PAYLOAD_DIR + "/amnezia"
+    WG_DIR = AMNEZIA_DIR+"/wireguard"
+    PORTMASTER_DIR = PAYLOAD_DIR + "/portmaster"
+    # Clear the directory
+    if os.path.exists(PAYLOAD_DIR) and os.path.isdir(PAYLOAD_DIR):
+        shutil.rmtree(PAYLOAD_DIR)
+
+    os.makedirs(WG_DIR, exist_ok=True)
+    os.makedirs(PORTMASTER_DIR, exist_ok=True)
+
+    # 1. Downloading files
+    for remote_path in ["/opt/amnezia/start.sh", "/opt/amnezia/wireguard/wg0.conf"]:
+        # Download the file from the container to the host in a temporary directory
+        temp_host_path = f"/tmp/{os.path.basename(remote_path)}"
+        ssh.exec_command(
+            f"docker cp {container_name}:{remote_path} {temp_host_path}")
+        ssh.exec_command(
+            f"chmod +r {temp_host_path}")
+        local_path = ""
+        if "wg0.conf" in remote_path:
+            local_path = os.path.join(
+                WG_DIR, os.path.basename(remote_path))
+        else:
+            local_path = os.path.join(
+                AMNEZIA_DIR, os.path.basename(remote_path))
+        try:
+            sftp = ssh.open_sftp()
+            sftp.get(temp_host_path, local_path)
+            sftp.close()
+        except Exception as e:
+            print(f"Error downloading file {temp_host_path}: {e}")
+            return
+
+    # 2. Modify server.conf
+    #server_conf_path = os.path.join(WG_DIR, "wg0.conf")
+    #with open(server_conf_path, "r+") as f:
+    #    server_conf_content = f.read()
+    #    if "PostDown" not in server_conf_content:
+    #        f.write("\nPostDown = /opt/amnezia/portmaster/wg-client-disconnect.sh %i\n")
+    # 3. Modify start.sh
+    start_sh_path = os.path.join(AMNEZIA_DIR, "start.sh")
+    with open(start_sh_path, "r+") as f:
+        lines = f.readlines()
+        for i in range(len(lines) - 2, -1, -1):
+            if lines[i].strip():
+                lines.insert(
+                    i + 1, "sudo -E -u portmaster /opt/portmaster/portmaster.sh &\n")
+                break
+        f.seek(0)
+        f.writelines(lines)
+
+    # 4. Determine the IP of the tun0 interface
+    try:
+        _, stdout, _ = ssh.exec_command(
+            f"docker exec {container_name} ip addr show wg0 | grep 'inet ' | awk '{{print $2}}' | cut -d'/' -f1")
+        portmaster_ip = stdout.read().decode().strip()
+        if not portmaster_ip:
+            print("Error: Could not determine the IP address of the wg0 interface.")
+            exit
+    except Exception as e:
+        print(f"Error determining the IP address of tun0: {e}")
+        exit
+
+    # 5. Get the container network name
+    try:
+        _, stdout, _ = ssh.exec_command(
+            f"docker inspect -f '{{{{.HostConfig.NetworkMode}}}}' {container_name}")
+        network_name = stdout.read().decode().strip()
+    except Exception as e:
+        print(f"Error getting NetworkMode: {e}")
+        return
+     
+    mounts = get_mounted_volumes(ssh, container_name)
+
+
+    # 6. Create create_container.sh
+    create_container_script = os.path.join(
+        PAYLOAD_DIR, "create_container.sh")
+    with open(create_container_script, "w") as f:
+        f.write("#!/bin/bash\n\n")
+        f.write(f"docker run -d \\\n")
+        f.write(f"  --name {container_name} \\\n")
+        f.write(f"  --privileged \\\n")
+        f.write(f"  --cap-add=NET_ADMIN \\\n")
+        f.write(f"  --restart always \\\n")
+
+        # Add port forwarding from tcp_ports, udp_ports, and port_range
+        for port in tcp_ports:
+            f.write(
+                f"  -p {port.split('/')[0]}:{port.split('/')[0]}/tcp \\\n")
+        for port in udp_ports:
+            f.write(
+                f"  -p {port.split('/')[0]}:{port.split('/')[0]}/udp \\\n")
+        f.write(
+            f"  -p {port_range}:{port_range}/tcp \\\n")
+        f.write(
+            f"  -p {port_range}:{port_range}/udp \\\n")
+        f.write(f"  -e PORTMASTER_IP={portmaster_ip} \\\n")
+        f.write(f"  -e PORTMASTER_PORT=50000 \\\n")
+        f.write(f"  -e EXPOSED_PORT_RANGE={port_range} \\\n")
+
+        # Add mounts to the Docker run command
+        for mount in mounts:
+            source = mount['Source']
+            destination = mount['Destination']
+            type = mount['Type']
+            # Add --mount options based on the mount type
+            if type == 'volume':
+                # bind,volume
+                f.write(
+                    f"  --mount type=volume,source={source},destination={destination} \\\n")
+            elif type == 'bind':
+                 read_only_str = ",readonly" if not mount.get('RW', True) else ""  # Only include ",readonly" if the mount is not RW
+                 if read_only_str:
+                     f.write(f"  --mount type=bind,source=\"{source}\",destination=\"{destination}\"{read_only_str} \\\n")
+                 else:
+                     f.write(f"  --mount type=bind,source=\"{source}\",destination=\"{destination}\" \\\n")
+
+        # Use the container name as the network name
+        f.write(f"  --network {network_name} \\\n")
+        f.write(f"  --security-opt label=disable \\\n")
+        f.write(
+            f"  amnezia-wireguard dumb-init /opt/amnezia/start.sh\n")
+        f.close
+
+    # 7. Create config for the bash script
+    config_path = os.path.join(PAYLOAD_DIR, "deploy_config.sh")
+    with open(config_path, "w") as f:
+        f.write("#!/bin/bash\n\n")
+        f.write(f"CONTAINER_NAME={container_name}\n")
+        f.close
+    # 8. Copy portmaster.sh to PORTMASTER_DIR
+    try:
+        shutil.copy(f"{WORK_DIR}/portmaster/portmaster.sh", PORTMASTER_DIR)
+    except FileNotFoundError:
+        print(
+            "Error: File portmaster.sh not found in the current directory.")
+        return
+
+    # 9. Copy ovpn-client-disconnect.sh to PORTMASTER_DIR
+    try:
+        shutil.copy(
+            f"{WORK_DIR}/portmaster/wg-client-disconnect.sh", PORTMASTER_DIR)
+    except FileNotFoundError:
+        print(
+            "Error: File wg-client-disconnect.sh not found in the current directory.")
+        return
+
+    # 10. Copy deploy.sh to PORTMASTER_DIR
+    try:
+        shutil.copy(f"{WORK_DIR}/deploy.sh", PAYLOAD_DIR)
+    except FileNotFoundError:
+        print(
+            "Error: File deploy.sh not found in the current directory.")
+        return
+
+
 def prepare_payload_openvpn(ssh, container_name, port_range, tcp_ports, udp_ports):
     """Downloads files from the container, modifies them, and saves them in PAYLOAD_DIR.
 
@@ -410,7 +614,7 @@ def prepare_payload_openvpn(ssh, container_name, port_range, tcp_ports, udp_port
         f.close
     # 8. Copy portmaster.sh to PORTMASTER_DIR
     try:
-        shutil.copy(f"{WORK_DIR}/Portmaster/portmaster.sh", PORTMASTER_DIR)
+        shutil.copy(f"{WORK_DIR}/portmaster/portmaster.sh", PORTMASTER_DIR)
     except FileNotFoundError:
         print(
             "Error: File portmaster.sh not found in the current directory.")
@@ -419,7 +623,7 @@ def prepare_payload_openvpn(ssh, container_name, port_range, tcp_ports, udp_port
     # 9. Copy ovpn-client-disconnect.sh to PORTMASTER_DIR
     try:
         shutil.copy(
-            f"{WORK_DIR}/Portmaster/ovpn-client-disconnect.sh", PORTMASTER_DIR)
+            f"{WORK_DIR}/portmaster/ovpn-client-disconnect.sh", PORTMASTER_DIR)
     except FileNotFoundError:
         print(
             "Error: File ovpn-client-disconnect.sh not found in the current directory.")
@@ -708,18 +912,21 @@ def main():
         if container_type == "openvpn":
             prepare_payload_openvpn(
                 ssh, selected_container, port_range, tcp_ports, udp_ports)
-            print(f"Ready to deploy to server {host}!")
-            print("\n")
-            print(
-                f"Now you have a chance to check the configuration files and scripts before deploying.")
-            print(
-                f"Deployment will take a couple of minutes. During this time, the connection to the VPN may be interrupted.")
-            print(
-                f"If something goes wrong, the script will restore the container from the backup.")
-            print("\n")
-            print(f"Deployment directory: {PAYLOAD_DIR}")
-            print_directory_structure(PAYLOAD_DIR)
-            print("\n")
+        elif container_type == "wireguard":
+            prepare_payload_wg(ssh, selected_container, port_range, tcp_ports, udp_ports)  # Assuming you have this function
+
+        print(f"Ready to deploy to server {host}!")
+        print("\n")
+        print(
+            f"Now you have a chance to check the configuration files and scripts before deploying.")
+        print(
+            f"Deployment will take a couple of minutes. During this time, the connection to the VPN may be interrupted.")
+        print(
+            f"If something goes wrong, the script will restore the container from the backup.")
+        print("\n")
+        print(f"Deployment directory: {PAYLOAD_DIR}")
+        print_directory_structure(PAYLOAD_DIR)
+        print("\n")
         confirmation = get_user_input(
             "Are you ready to continue?", lambda x: x.lower() in ['y', 'n'], default='n')
         if confirmation.lower() == 'y':
@@ -748,6 +955,8 @@ def main():
                         else:
                             print(
                                 f"Directory {remote_deploy_dir} deleted.")
+                    if os.path.exists(PAYLOAD_DIR) and os.path.isdir(PAYLOAD_DIR):
+                        shutil.rmtree(PAYLOAD_DIR)
                     print("Installation complete!")
                 else:
                     print(

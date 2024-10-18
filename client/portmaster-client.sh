@@ -4,7 +4,7 @@
 CONFIG_FILE="portmaster.conf"
 SERVER_IP="10.8.0.1"  # Replace with the IP of your VPN server on the TUN interface
 SERVER_PORT="50000"    # The port your portmaster listens on
-TUN_IFACE="utun3" # The name of the TUN interface of the VPN server where portmaster is running
+#TUN_IFACE="utun3" # The name of the TUN interface of the VPN server where portmaster is running
 # Flag indicating that we are sending a request to clear all forwarded ports
 # Set in the disconnect function
 DISCONNECT_REQUEST=0
@@ -96,11 +96,11 @@ delete_port() {
 
 # Function asks to remove all port forwarding rules for current client
 disconnect() {
-    IP=$(ifconfig $TUN_IFACE | grep 'inet ' | awk '{print $2}')
-    if [ -z "$IP" ]; then
-        echo "Error: Could not determine IP address."
-        return 1  # Return 1 to indicate an error
-    fi
+    #IP=$(ifconfig $TUN_IFACE | grep 'inet ' | awk '{print $2}')
+    #if [ -z "$IP" ]; then
+    #    echo "Error: Could not determine IP address."
+    #    return 1  # Return 1 to indicate an error
+    #fi
     DISCONNECT_REQUEST=1
     return 0  # Return 0 to indicate success
 }
@@ -204,7 +204,8 @@ fi
 if [[ "$DISCONNECT_REQUEST" -eq 0 ]]; then
     response=$(cat "$CONFIG_FILE" | nc "$SERVER_IP" "$SERVER_PORT")
 else
-    response=$(echo "DISCONNECT: $IP" | nc "$SERVER_IP" "$SERVER_PORT")
+    #Client can send any IP as IP will be ignored, because disconnect requests to different IPs are accepted only from server
+    response=$(echo "DISCONNECT: 10.8.0.2" | nc "$SERVER_IP" "$SERVER_PORT")
     echo "Disconnect request sent."
 fi
 

@@ -914,6 +914,9 @@ def main():
                 ssh, selected_container, port_range, tcp_ports, udp_ports)
         elif container_type == "wireguard":
             prepare_payload_wg(ssh, selected_container, port_range, tcp_ports, udp_ports)  # Assuming you have this function
+        else: 
+            print("Unsupported container type!")
+            exit
 
         print(f"Ready to deploy to server {host}!")
         print("\n")

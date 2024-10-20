@@ -4,10 +4,24 @@ import paramiko
 from getpass import getpass
 import json
 import shutil
+import sys
+import time
+
+WORK_DIR = ""
+if getattr(sys, 'frozen', False):  # Check id script is compiled
+    WORK_DIR = os.path.dirname(sys.executable)
+else:
+    WORK_DIR = os.path.dirname(__file__)
 
 # Path to the payload script (by default, next to the main script)
 PAYLOAD_SCRIPT_PATH = os.path.join(
-    os.path.dirname(__file__), "deploy_portmaster.sh")
+    WORK_DIR, "deploy_portmaster.sh")
+SUPPORTED_VPN_TYPES = ["Amnezia OpenVPN", "Amnezia Wireguard"]
+DEFAULT_CONTAINERS = {
+    "amnezia-openvpn": "openvpn",
+    "amnezia-wireguard": "wireguard"
+}
+
 SUPPORTED_VPN_TYPES = ["Amnezia OpenVPN", "Amnezia Wireguard"]
 DEFAULT_CONTAINERS = {
     "amnezia-openvpn": "openvpn",
@@ -24,11 +38,10 @@ PAYLOAD_EXPLANATION = {
 
 DEFAULT_CONTAINER_TYPE = "openvpn"
 USERNAME = ""
-WORK_DIR = os.path.dirname(os.path.abspath(__file__))
-CLIENT_CONFIG = WORK_DIR+"/client/portmaster.conf"
-PAYLOAD_DIR = WORK_DIR + "/payload"
-BACKUP_CONTAINER_NAME=""
-PORTMASTER_PORT=50000
+CLIENT_CONFIG = os.path.join(WORK_DIR, "client", "portmaster.conf")
+PAYLOAD_DIR = os.path.join(WORK_DIR, "payload")
+BACKUP_CONTAINER_NAME = ""
+PORTMASTER_PORT = 50000
 
 
 def get_user_input(prompt, validation_func=None, default=None, hide_input=False, require_confirmation=False):
@@ -79,10 +92,13 @@ def get_user_input(prompt, validation_func=None, default=None, hide_input=False,
 
 
 def write_client_conf(server_ip, server_port):
-    with open(CLIENT_CONFIG, "w") as f:
-        f.write(f"SERVER_IP={server_ip}")
-        f.write(f"SERVER_PORT={server_port}")
-        f.write("PORTS=()")
+    # Используем '\r\n' для Windows, '\n' для остальных ОС
+    newline = '\r\n' if os.name == 'nt' else '\n'
+    with open(CLIENT_CONFIG, "w", newline=newline) as f:
+        f.write(f"SERVER_IP={server_ip}{newline}")
+        f.write(f"SERVER_PORT={server_port}{newline}")
+        f.write(f"PORTS=(){newline}")
+
 
 def validate_ip_address(ip):
     """Checks the validity of the IP address.
@@ -184,7 +200,8 @@ def print_docker_access_help(os_name, distribution):
         if distribution:
             print(
                 f"You probably need to add the user to the 'docker' group on the {distribution} distribution.")
-            print(f"Connect to the server via SSH and run the command (as root or using sudo):")
+            print(
+                f"Connect to the server via SSH and run the command (as root or using sudo):")
             print(f"  sudo usermod -aG docker {USERNAME}")
         else:
             print(
@@ -331,6 +348,7 @@ def get_mounted_volumes(ssh_client, container_name):
         print(f"An error occurred: {e}")
         return []  # Return an empty list in case of exception
 
+
 def prepare_payload_wg(ssh, container_name, port_range, tcp_ports, udp_ports):
     """Downloads files from the container, modifies them, and saves them in PAYLOAD_DIR.
 
@@ -341,9 +359,10 @@ def prepare_payload_wg(ssh, container_name, port_range, tcp_ports, udp_ports):
         tcp_ports (list): List of container TCP ports.
         udp_ports (list): List of container UDP ports. 
     """
-    AMNEZIA_DIR = PAYLOAD_DIR + "/amnezia"
-    WG_DIR = AMNEZIA_DIR+"/wireguard"
-    PORTMASTER_DIR = PAYLOAD_DIR + "/portmaster"
+    AMNEZIA_DIR = os.path.join(PAYLOAD_DIR, "amnezia")
+    WG_DIR = os.path.join(AMNEZIA_DIR, "wireguard")
+    PORTMASTER_DIR = os.path.join(PAYLOAD_DIR, "portmaster")
+
     # Clear the directory
     if os.path.exists(PAYLOAD_DIR) and os.path.isdir(PAYLOAD_DIR):
         shutil.rmtree(PAYLOAD_DIR)
@@ -375,14 +394,14 @@ def prepare_payload_wg(ssh, container_name, port_range, tcp_ports, udp_ports):
             return
 
     # 2. Modify server.conf
-    #server_conf_path = os.path.join(WG_DIR, "wg0.conf")
-    #with open(server_conf_path, "r+") as f:
+    # server_conf_path = os.path.join(WG_DIR, "wg0.conf")
+    # with open(server_conf_path, "r+") as f:
     #    server_conf_content = f.read()
     #    if "PostDown" not in server_conf_content:
     #        f.write("\nPostDown = /opt/amnezia/portmaster/wg-client-disconnect.sh %i\n")
     # 3. Modify start.sh
     start_sh_path = os.path.join(AMNEZIA_DIR, "start.sh")
-    with open(start_sh_path, "r+") as f:
+    with open(start_sh_path, "r+", newline='\n') as f:
         lines = f.readlines()
         for i in range(len(lines) - 2, -1, -1):
             if lines[i].strip():
@@ -405,7 +424,7 @@ def prepare_payload_wg(ssh, container_name, port_range, tcp_ports, udp_ports):
         exit
 
     write_client_conf(portmaster_ip, PORTMASTER_PORT)
-    
+
     create_container_script = os.path.join(
         PAYLOAD_DIR, "create_container.sh")
     create_start_container_script(
@@ -413,37 +432,40 @@ def prepare_payload_wg(ssh, container_name, port_range, tcp_ports, udp_ports):
 
     # 7. Create config for the bash script
     config_path = os.path.join(PAYLOAD_DIR, "deploy_config.sh")
-    with open(config_path, "w") as f:
+    with open(config_path, "w", newline='\n') as f:
         f.write("#!/bin/bash\n\n")
         f.write(f"CONTAINER_NAME={container_name}\n")
         f.close
     # 8. Copy portmaster.sh to PORTMASTER_DIR
     try:
-        shutil.copy(f"{WORK_DIR}/portmaster/portmaster.sh", PORTMASTER_DIR)
+        my_script = os.path.join(WORK_DIR, "portmaster", "portmaster.sh")
+        shutil.copy(my_script, PORTMASTER_DIR)
     except FileNotFoundError:
         print(
             "Error: File portmaster.sh not found in the current directory.")
-        return
+        exit
 
-    # 9. Copy ovpn-client-disconnect.sh to PORTMASTER_DIR
+    # 9. Copy client-disconnect to PORTMASTER_DIR
     try:
-        shutil.copy(
-            f"{WORK_DIR}/portmaster/wg-client-disconnect.sh", PORTMASTER_DIR)
+        my_script = os.path.join(
+            WORK_DIR, "portmaster", "wg-client-disconnect.sh")
+        shutil.copy(my_script, PORTMASTER_DIR)
     except FileNotFoundError:
         print(
             "Error: File wg-client-disconnect.sh not found in the current directory.")
-        return
+        exit
 
     # 10. Copy deploy.sh to PORTMASTER_DIR
     try:
-        shutil.copy(f"{WORK_DIR}/deploy.sh", PAYLOAD_DIR)
+        my_script = os.path.join(WORK_DIR, "deploy.sh")
+        shutil.copy(my_script, PAYLOAD_DIR)
     except FileNotFoundError:
         print(
             "Error: File deploy.sh not found in the current directory.")
-        return
+        exit
 
 
-def create_start_container_script(ssh,script_path, container_name, port_range, portmaster_ip, portmaster_port):
+def create_start_container_script(ssh, script_path, container_name, port_range, portmaster_ip, portmaster_port):
     # Получаем информацию о контейнере
     inspect_cmd = f"docker inspect {container_name}"
     stdin, stdout, stderr = ssh.exec_command(inspect_cmd)
@@ -452,18 +474,19 @@ def create_start_container_script(ssh,script_path, container_name, port_range, p
     # Начинаем составление команды
     run_args = [f"docker run -d --name {container_name}"]
 
-    #Получаем уже проброшенные порты
-    existing_ports = container_info.get("HostConfig", {}).get("PortBindings", {})
+    # Получаем уже проброшенные порты
+    existing_ports = container_info.get(
+        "HostConfig", {}).get("PortBindings", {})
     for port_proto, bindings in existing_ports.items():
         for binding in bindings:
             host_port = binding["HostPort"]
             run_args.append(f"-p {host_port}:{port_proto}")
 
-    #Обработка диапазона портов
+    # Обработка диапазона портов
     run_args.append(f"-p {port_range}:{port_range}/udp")
     run_args.append(f"-p {port_range}:{port_range}/tcp")
 
-    #Добавляем Volume
+    # Добавляем Volume
     volumes = container_info.get("Mounts", [])
     for volume in volumes:
         source = volume["Source"]
@@ -488,33 +511,31 @@ def create_start_container_script(ssh,script_path, container_name, port_range, p
     if restart_policy:
         run_args.append(f"--restart {restart_policy}")
 
-    #Добавляем устройства (если есть)
+    # Добавляем устройства (если есть)
     devices = container_info["HostConfig"].get("Devices", [])
     for device in devices:
         path_on_host = device["PathOnHost"]
         path_in_container = device["PathInContainer"]
         run_args.append(f"--device {path_on_host}:{path_in_container}")
 
-    #Добавляем капабилити
+    # Добавляем капабилити
     capabilities = container_info["HostConfig"].get("CapAdd", [])
     for cap in capabilities:
         run_args.append(f"--cap-add {cap}")
 
     networks = list(container_info["NetworkSettings"]["Networks"].keys())
 
-
-
-    #Привилегированный режим
+    # Привилегированный режим
     privileged = container_info["HostConfig"].get("Privileged", False)
     if privileged:
         run_args.append("--privileged")
 
-    #Образ контейнера
+    # Образ контейнера
     image = container_info["Config"]["Image"]
     run_args.append(f"{image} dumb-init /opt/amnezia/start.sh")
-  
+
     # Сохраняем команду в скрипт
-    with open(script_path, "w") as f:
+    with open(script_path, "w", newline='\n') as f:
         f.write("#!/bin/bash\n")
         # Записываем все аргументы, кроме последнего, с переносом строки
         for arg in run_args[:-1]:
@@ -537,9 +558,10 @@ def prepare_payload_openvpn(ssh, container_name, port_range, tcp_ports, udp_port
         tcp_ports (list): List of container TCP ports.
         udp_ports (list): List of container UDP ports. 
     """
-    AMNEZIA_DIR = PAYLOAD_DIR + "/amnezia"
-    OPENVPN_DIR = AMNEZIA_DIR+"/openvpn"
-    PORTMASTER_DIR = PAYLOAD_DIR + "/portmaster"
+    AMNEZIA_DIR = os.path.join(PAYLOAD_DIR, "amnezia")
+    OPENVPN_DIR = os.path.join(AMNEZIA_DIR, "openvpn")
+    PORTMASTER_DIR = os.path.join(PAYLOAD_DIR, "portmaster")
+
     # Clear the directory
     if os.path.exists(PAYLOAD_DIR) and os.path.isdir(PAYLOAD_DIR):
         shutil.rmtree(PAYLOAD_DIR)
@@ -572,7 +594,7 @@ def prepare_payload_openvpn(ssh, container_name, port_range, tcp_ports, udp_port
 
     # 2. Modify server.conf
     server_conf_path = os.path.join(OPENVPN_DIR, "server.conf")
-    with open(server_conf_path, "r+") as f:
+    with open(server_conf_path, "r+", newline='\n') as f:
         server_conf_content = f.read()
         if "client-disconnect" not in server_conf_content:
             f.write("\nscript-security 2\n")
@@ -581,7 +603,7 @@ def prepare_payload_openvpn(ssh, container_name, port_range, tcp_ports, udp_port
 
     # 3. Modify start.sh
     start_sh_path = os.path.join(AMNEZIA_DIR, "start.sh")
-    with open(start_sh_path, "r+") as f:
+    with open(start_sh_path, "r+", newline='\n') as f:
         lines = f.readlines()
         for i in range(len(lines) - 2, -1, -1):
             if lines[i].strip():
@@ -602,44 +624,48 @@ def prepare_payload_openvpn(ssh, container_name, port_range, tcp_ports, udp_port
     except Exception as e:
         print(f"Error determining the IP address of tun0: {e}")
         exit
-    
-    write_client_conf(portmaster_ip,PORTMASTER_PORT)
 
-    #Create create_container.sh
+    write_client_conf(portmaster_ip, PORTMASTER_PORT)
+
+    # Create create_container.sh
     create_container_script = os.path.join(
         PAYLOAD_DIR, "create_container.sh")
-    create_start_container_script(ssh, create_container_script, container_name, port_range, portmaster_ip, PORTMASTER_PORT)
+    create_start_container_script(
+        ssh, create_container_script, container_name, port_range, portmaster_ip, PORTMASTER_PORT)
 
     # 7. Create config for the bash script
     config_path = os.path.join(PAYLOAD_DIR, "deploy_config.sh")
-    with open(config_path, "w") as f:
+    with open(config_path, "w", newline='\n') as f:
         f.write("#!/bin/bash\n\n")
         f.write(f"CONTAINER_NAME={container_name}\n")
         f.close
     # 8. Copy portmaster.sh to PORTMASTER_DIR
     try:
-        shutil.copy(f"{WORK_DIR}/portmaster/portmaster.sh", PORTMASTER_DIR)
+        my_script = os.path.join(WORK_DIR, "portmaster", "portmaster.sh")
+        shutil.copy(my_script, PORTMASTER_DIR)
     except FileNotFoundError:
         print(
             "Error: File portmaster.sh not found in the current directory.")
-        return
+        exit
 
     # 9. Copy ovpn-client-disconnect.sh to PORTMASTER_DIR
     try:
-        shutil.copy(
-            f"{WORK_DIR}/portmaster/ovpn-client-disconnect.sh", PORTMASTER_DIR)
+        my_script = os.path.join(
+            WORK_DIR, "portmaster", "ovpn-client-disconnect.sh")
+        shutil.copy(my_script, PORTMASTER_DIR)
     except FileNotFoundError:
         print(
             "Error: File ovpn-client-disconnect.sh not found in the current directory.")
-        return
+        exit
 
     # 10. Copy deploy.sh to PORTMASTER_DIR
     try:
-        shutil.copy(f"{WORK_DIR}/deploy.sh", PAYLOAD_DIR)
+        my_script = os.path.join(WORK_DIR, "deploy.sh")
+        shutil.copy(my_script, PAYLOAD_DIR)
     except FileNotFoundError:
         print(
-            "Error: File portmaster.sh not found in the current directory.")
-        return
+            "Error: File deploy.sh not found in the current directory.")
+        exit
 
 
 def print_directory_structure(dir_path, indent=""):
@@ -698,7 +724,7 @@ def upload_payload(ssh, container_type, payload_dir):
     def recursive_upload(sftp, local_dir, remote_dir):
         for item in os.listdir(local_dir):
             local_path = os.path.join(local_dir, item)
-            remote_path = os.path.join(remote_dir, item)
+            remote_path = os.path.join(remote_dir, item).replace('\\', '/')
             if os.path.isfile(local_path):
                 sftp.put(local_path, remote_path)
             elif os.path.isdir(local_path):
@@ -707,7 +733,6 @@ def upload_payload(ssh, container_type, payload_dir):
                 except IOError:
                     pass  # The directory may already exist
                 recursive_upload(sftp, local_path, remote_path)
-
     try:
         with ssh.open_sftp() as sftp:
             recursive_upload(sftp, payload_dir, remote_payload_dir)
@@ -723,7 +748,7 @@ def upload_payload(ssh, container_type, payload_dir):
         return None
 
     # 4. Return the path to deploy.sh on the server
-    deploy_script_path = os.path.join(remote_payload_dir, "deploy.sh")
+    deploy_script_path = f"{remote_payload_dir}/deploy.sh"
     return deploy_script_path
 
 
@@ -753,7 +778,8 @@ def execute_remote_script(ssh, script_path):
                 if "BACKUP CONTAINER NAME:" in output:
                     bcp_cont_name = output.split(
                         "BACKUP CONTAINER NAME: ")[-1].strip()
-                    print(f"Container backed up under the name: {bcp_cont_name}")
+                    print(
+                        f"Container backed up under the name: {bcp_cont_name}")
 
             if channel.exit_status_ready():
                 exit_code = channel.recv_exit_status()
@@ -769,13 +795,33 @@ def execute_remote_script(ssh, script_path):
     return bcp_cont_name
 
 
+def check_container_exists(ssh, container_name):
+    try:
+        # Команда для поиска контейнера по имени (включая остановленные)
+        command = f"docker ps -a --filter name={container_name} --format '{{{{.Names}}}}'"
+
+        # Выполнение команды через SSH
+        stdin, stdout, stderr = ssh.exec_command(command)
+
+        # Чтение вывода
+        output = stdout.read().decode().strip()
+
+        # Если контейнер с таким именем существует, он будет в выводе
+        if output == container_name:
+            return True
+        else:
+            return False
+    except Exception as e:
+        print(f"Error checking container: {e}")
+        return False
+
 def main():
     """Main function of the script."""
-    
-    print ("The installer script will install portmaster port forwarder into AmneziaVPN container")
-    print ("Currently Amnezia OpenVPN and Amnezia WireGuard are supported")
+
+    print("The installer script will install portmaster port forwarder into AmneziaVPN container")
+    print("Currently Amnezia OpenVPN and Amnezia WireGuard are supported")
     print("Please proceed with SSH connecton info")
-    print ("\n")
+    print("\n")
     while True:
         # 1. Request SSH connection details
         host = get_user_input(
@@ -922,8 +968,10 @@ def main():
             prepare_payload_openvpn(
                 ssh, selected_container, port_range, tcp_ports, udp_ports)
         elif container_type == "wireguard":
-            prepare_payload_wg(ssh, selected_container, port_range, tcp_ports, udp_ports)  # Assuming you have this function
-        else: 
+            # Assuming you have this function
+            prepare_payload_wg(ssh, selected_container,
+                               port_range, tcp_ports, udp_ports)
+        else:
             print("Unsupported container type!")
             exit
 
@@ -951,8 +999,9 @@ def main():
                 print(
                     f"Installation complete. Connect to the VPN server.")
                 confirmation = get_user_input("Were you able to connect to the VPN server?(y/N)",
-                                             lambda x: x.lower() in ['y', 'n'],
-                                             default='n')
+                                              lambda x: x.lower() in [
+                                                  'y', 'n'],
+                                              default='n')
                 if confirmation.lower() == "y":
                     print("Excellent! Deleting backups...")
                     ssh.exec_command(f"docker remove {BACKUP_CONTAINER_NAME}")
@@ -969,38 +1018,46 @@ def main():
                                 f"Directory {remote_deploy_dir} deleted.")
                     if os.path.exists(PAYLOAD_DIR) and os.path.isdir(PAYLOAD_DIR):
                         shutil.rmtree(PAYLOAD_DIR)
-                    
-                    print(f"Ports {port_range} successfully exposed in {container_name} container")
-                    print(f"You can now use portmaster-client.sh -add <port> to forward ports through VPN tunnel to your machine")
+
+                    print(
+                        f"Ports {port_range} successfully exposed in {container_name} container")
+                    print(
+                        f"You can now use portmaster-client.sh -add <port> to forward ports through VPN tunnel to your machine")
                     print(
                         f"You can also edit portmaster.conf to forward several ports for example PORTS=(10090 10091 10092....)")
                     print("Installation complete!")
+                    time.sleep(10)
                 else:
                     print(
                         "Something went wrong... restoring the container from the backup...")
+                    have_backup = check_container_exists(ssh,BACKUP_CONTAINER_NAME)
+                    if have_backup:
+                        # Stop the container
+                        stdin, stdout, stderr = ssh.exec_command(
+                            f"docker stop {selected_container}")
+                        stdout.channel.recv_exit_status()  # Wait for the container to stop
 
-                    # Stop the container
-                    stdin, stdout, stderr = ssh.exec_command(
-                        f"docker stop {selected_container}")
-                    stdout.channel.recv_exit_status()  # Wait for the container to stop
+                        # Remove the container
+                        stdin, stdout, stderr = ssh.exec_command(
+                            f"docker remove {selected_container}")
+                        stdout.channel.recv_exit_status()  # Wait for the container to be removed
 
-                    # Remove the container
-                    stdin, stdout, stderr = ssh.exec_command(
-                        f"docker remove {selected_container}")
-                    stdout.channel.recv_exit_status()  # Wait for the container to be removed
+                       # Rename the backup container
+                        stdin, stdout, stderr = ssh.exec_command(
+                            f"docker rename {BACKUP_CONTAINER_NAME} {selected_container}")
+                        stdout.channel.recv_exit_status()  # Wait for the container to be renamed
 
-                    # Rename the backup container
-                    stdin, stdout, stderr = ssh.exec_command(
-                        f"docker rename {BACKUP_CONTAINER_NAME} {selected_container}")
-                    stdout.channel.recv_exit_status()  # Wait for the container to be renamed
-
-                    # Start the container
-                    stdin, stdout, stderr = ssh.exec_command(
-                        f"docker start {selected_container}")
-                    stdout.channel.recv_exit_status()  # Wait for the container to start
-
-                    print(
-                        "Container started from backup. All changes have been reverted...")
+                        # Start the container
+                        stdin, stdout, stderr = ssh.exec_command(
+                            f"docker start {selected_container}")
+                        stdout.channel.recv_exit_status()  # Wait for the container to start
+                        print(
+                            "Container started from backup. All changes have been reverted...")
+                        time.sleep(3)
+                    else:
+                        print("Script failed before creating backup...")
+                        print("Your VPN Server container has not been touched.")
+                        time.sleep(3)
 
 
 if __name__ == "__main__":

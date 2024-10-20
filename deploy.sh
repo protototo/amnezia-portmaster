@@ -170,7 +170,7 @@ docker exec "$CONTAINER_NAME" chmod -R +w /opt/portmaster/log
 # Restore permissions for the /opt directory as it was
 restore_permissions "$CONTAINER_NAME" "$SCRIPT_DIR"
 echo "File permissions restored."
-
+echo "Restarting container(may take a while)..."
 # Restart the container
 docker restart "$CONTAINER_NAME"
 echo "Container $CONTAINER_NAME restarted."

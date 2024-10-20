@@ -253,7 +253,10 @@ function Send-Data {
 }
 
 $REQUEST = ""
-
+# Проверка на наличие действия
+if (-not $Action) {
+   $REQUEST = "PORTS: " + "$($PORTS  -join ', ')"
+}else{
 switch ($Action) {
     'add' {
         if (-Not $Port) {
@@ -282,6 +285,7 @@ switch ($Action) {
         }
         Test-PortForwarding $Port
     }
+}
 }
 
 if ($Action -ne "test"){

@@ -2,7 +2,7 @@
 
 # Specify variables
 CONFIG_FILE="portmaster.conf"
-SERVER_IP="10.8.0.1"  # Replace with the IP of your VPN server on the TUN interface
+SERVER_IP="10.8.1.0"  # Replace with the IP of your VPN server on the TUN interface
 SERVER_PORT="50000"    # The port your portmaster listens on
 #TUN_IFACE="utun3" # The name of the TUN interface of the VPN server where portmaster is running
 # Flag indicating that we are sending a request to clear all forwarded ports

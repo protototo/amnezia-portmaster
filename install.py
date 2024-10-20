@@ -1,3 +1,4 @@
+import re
 import os
 import paramiko
 from getpass import getpass
@@ -26,6 +27,7 @@ USERNAME = ""
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
 PAYLOAD_DIR = WORK_DIR + "/payload"
 BACKUP_CONTAINER_NAME=""
+PORTMASTER_PORT=50000
 
 # Function for secure user input
 def get_user_input(prompt, validation_func=None, default=None, hide_input=False):
@@ -392,68 +394,11 @@ def prepare_payload_wg(ssh, container_name, port_range, tcp_ports, udp_ports):
     except Exception as e:
         print(f"Error determining the IP address of tun0: {e}")
         exit
-
-    # 5. Get the container network name
-    try:
-        _, stdout, _ = ssh.exec_command(
-            f"docker inspect -f '{{{{.HostConfig.NetworkMode}}}}' {container_name}")
-        network_name = stdout.read().decode().strip()
-    except Exception as e:
-        print(f"Error getting NetworkMode: {e}")
-        return
-     
-    mounts = get_mounted_volumes(ssh, container_name)
-
-
-    # 6. Create create_container.sh
+    
     create_container_script = os.path.join(
         PAYLOAD_DIR, "create_container.sh")
-    with open(create_container_script, "w") as f:
-        f.write("#!/bin/bash\n\n")
-        f.write(f"docker run -d \\\n")
-        f.write(f"  --name {container_name} \\\n")
-        f.write(f"  --privileged \\\n")
-        f.write(f"  --cap-add=NET_ADMIN \\\n")
-        f.write(f"  --restart always \\\n")
-
-        # Add port forwarding from tcp_ports, udp_ports, and port_range
-        for port in tcp_ports:
-            f.write(
-                f"  -p {port.split('/')[0]}:{port.split('/')[0]}/tcp \\\n")
-        for port in udp_ports:
-            f.write(
-                f"  -p {port.split('/')[0]}:{port.split('/')[0]}/udp \\\n")
-        f.write(
-            f"  -p {port_range}:{port_range}/tcp \\\n")
-        f.write(
-            f"  -p {port_range}:{port_range}/udp \\\n")
-        f.write(f"  -e PORTMASTER_IP={portmaster_ip} \\\n")
-        f.write(f"  -e PORTMASTER_PORT=50000 \\\n")
-        f.write(f"  -e EXPOSED_PORT_RANGE={port_range} \\\n")
-
-        # Add mounts to the Docker run command
-        for mount in mounts:
-            source = mount['Source']
-            destination = mount['Destination']
-            type = mount['Type']
-            # Add --mount options based on the mount type
-            if type == 'volume':
-                # bind,volume
-                f.write(
-                    f"  --mount type=volume,source={source},destination={destination} \\\n")
-            elif type == 'bind':
-                 read_only_str = ",readonly" if not mount.get('RW', True) else ""  # Only include ",readonly" if the mount is not RW
-                 if read_only_str:
-                     f.write(f"  --mount type=bind,source=\"{source}\",destination=\"{destination}\"{read_only_str} \\\n")
-                 else:
-                     f.write(f"  --mount type=bind,source=\"{source}\",destination=\"{destination}\" \\\n")
-
-        # Use the container name as the network name
-        f.write(f"  --network {network_name} \\\n")
-        f.write(f"  --security-opt label=disable \\\n")
-        f.write(
-            f"  amnezia-wireguard dumb-init /opt/amnezia/start.sh\n")
-        f.close
+    create_start_container_script(
+        ssh, create_container_script, container_name, port_range, portmaster_ip, PORTMASTER_PORT)
 
     # 7. Create config for the bash script
     config_path = os.path.join(PAYLOAD_DIR, "deploy_config.sh")
@@ -485,6 +430,90 @@ def prepare_payload_wg(ssh, container_name, port_range, tcp_ports, udp_ports):
         print(
             "Error: File deploy.sh not found in the current directory.")
         return
+
+
+def create_start_container_script(ssh,script_path, container_name, port_range, portmaster_ip, portmaster_port):
+    # Получаем информацию о контейнере
+    inspect_cmd = f"docker inspect {container_name}"
+    stdin, stdout, stderr = ssh.exec_command(inspect_cmd)
+    container_info = json.loads(stdout.read().decode())[0]
+
+    # Начинаем составление команды
+    run_args = [f"docker run -d --name {container_name}"]
+
+    #Получаем уже проброшенные порты
+    existing_ports = container_info.get("HostConfig", {}).get("PortBindings", {})
+    for port_proto, bindings in existing_ports.items():
+        for binding in bindings:
+            host_port = binding["HostPort"]
+            run_args.append(f"-p {host_port}:{port_proto}")
+
+    #Обработка диапазона портов
+    run_args.append(f"-p {port_range}:{port_range}/udp")
+    run_args.append(f"-p {port_range}:{port_range}/tcp")
+
+    #Добавляем Volume
+    volumes = container_info.get("Mounts", [])
+    for volume in volumes:
+        source = volume["Source"]
+        destination = volume["Destination"]
+        run_args.append(f"-v {source}:{destination}")
+
+    # 4. Добавляем переменные окружения
+    env_vars = container_info.get("Config", {}).get("Env", [])
+    for env in env_vars:
+        run_args.append(f"-e {env}")
+    run_args.append(f"-e PORTMASTER_IP={portmaster_ip}")
+    run_args.append(f"-e PORTMASTER_PORT={portmaster_port}")
+    run_args.append(f"-e EXPOSED_PORT_RANGE={port_range}")
+    # 5. Добавляем сеть
+    network_mode = container_info["HostConfig"].get("NetworkMode", "default")
+    if network_mode:
+        run_args.append(f"--network {network_mode}")
+
+    # 6. Добавляем рестарт политику
+    restart_policy = container_info["HostConfig"].get(
+        "RestartPolicy", {}).get("Name", "")
+    if restart_policy:
+        run_args.append(f"--restart {restart_policy}")
+
+    #Добавляем устройства (если есть)
+    devices = container_info["HostConfig"].get("Devices", [])
+    for device in devices:
+        path_on_host = device["PathOnHost"]
+        path_in_container = device["PathInContainer"]
+        run_args.append(f"--device {path_on_host}:{path_in_container}")
+
+    #Добавляем капабилити
+    capabilities = container_info["HostConfig"].get("CapAdd", [])
+    for cap in capabilities:
+        run_args.append(f"--cap-add {cap}")
+
+    networks = list(container_info["NetworkSettings"]["Networks"].keys())
+
+
+
+    #Привилегированный режим
+    privileged = container_info["HostConfig"].get("Privileged", False)
+    if privileged:
+        run_args.append("--privileged")
+
+    #Образ контейнера
+    image = container_info["Config"]["Image"]
+    run_args.append(f"{image} dumb-init /opt/amnezia/start.sh")
+  
+    # Сохраняем команду в скрипт
+    with open(script_path, "w") as f:
+        f.write("#!/bin/bash\n")
+        # Записываем все аргументы, кроме последнего, с переносом строки
+        for arg in run_args[:-1]:
+            f.write(f"{arg}  \\\n")
+        # Записываем последний аргумент без переноса строки
+        f.write(f"{run_args[-1]}\n")
+        for network in networks:
+            if network != "bridge":
+                f.write(f"docker network connect {network} {container_name}\n")
+    print(f"Скрипт сохранен: {script_path}")
 
 
 def prepare_payload_openvpn(ssh, container_name, port_range, tcp_ports, udp_ports):
@@ -562,49 +591,54 @@ def prepare_payload_openvpn(ssh, container_name, port_range, tcp_ports, udp_port
     except Exception as e:
         print(f"Error determining the IP address of tun0: {e}")
         exit
-
-    # 5. Get the container network name
-    try:
-        _, stdout, _ = ssh.exec_command(
-            f"docker inspect -f '{{{{.HostConfig.NetworkMode}}}}' {container_name}")
-        network_name = stdout.read().decode().strip()
-    except Exception as e:
-        print(f"Error getting NetworkMode: {e}")
-        return
-
-    # 6. Create create_container.sh
+    
+    #Create create_container.sh
     create_container_script = os.path.join(
         PAYLOAD_DIR, "create_container.sh")
-    with open(create_container_script, "w") as f:
-        f.write("#!/bin/bash\n\n")
-        f.write(f"docker run -d \\\n")
-        f.write(f"  --name {container_name} \\\n")
-        f.write(f"  --privileged \\\n")
-        f.write(f"  --cap-add=NET_ADMIN \\\n")
-        f.write(f"  --restart always \\\n")
+    create_start_container_script(ssh, create_container_script, container_name, port_range, portmaster_ip, PORTMASTER_PORT)
 
-        # Add port forwarding from tcp_ports, udp_ports, and port_range
-        for port in tcp_ports:
-            f.write(
-                f"  -p {port.split('/')[0]}:{port.split('/')[0]}/tcp \\\n")
-        for port in udp_ports:
-            f.write(
-                f"  -p {port.split('/')[0]}:{port.split('/')[0]}/udp \\\n")
-        f.write(
-            f"  -p {port_range}:{port_range}/tcp \\\n")
-        f.write(
-            f"  -p {port_range}:{port_range}/udp \\\n")
-        f.write(f"  -e PORTMASTER_IP={portmaster_ip} \\\n")
-        f.write(f"  -e PORTMASTER_PORT=50000 \\\n")
-        f.write(f"  -e EXPOSED_PORT_RANGE={port_range} \\\n")
 
-        # Other container parameters
-        # Use the container name as the network name
-        f.write(f"  --network {network_name} \\\n")
-        f.write(f"  --security-opt label=disable \\\n")
-        f.write(
-            f"  amnezia-openvpn dumb-init /opt/amnezia/start.sh\n")
-        f.close
+
+    # # 5. Get the container network name
+    # try:
+    #     _, stdout, _ = ssh.exec_command(
+    #         f"docker inspect -f '{{{{.HostConfig.NetworkMode}}}}' {container_name}")
+    #     network_name = stdout.read().decode().strip()
+    # except Exception as e:
+    #     print(f"Error getting NetworkMode: {e}")
+    #     return
+
+
+    # with open(create_container_script, "w") as f:
+    #     f.write("#!/bin/bash\n\n")
+    #     f.write(f"docker run -d \\\n")
+    #     f.write(f"  --name {container_name} \\\n")
+    #     f.write(f"  --privileged \\\n")
+    #     f.write(f"  --cap-add=NET_ADMIN \\\n")
+    #     f.write(f"  --restart always \\\n")
+
+    #     # Add port forwarding from tcp_ports, udp_ports, and port_range
+    #     for port in tcp_ports:
+    #         f.write(
+    #             f"  -p {port.split('/')[0]}:{port.split('/')[0]}/tcp \\\n")
+    #     for port in udp_ports:
+    #         f.write(
+    #             f"  -p {port.split('/')[0]}:{port.split('/')[0]}/udp \\\n")
+    #     f.write(
+    #         f"  -p {port_range}:{port_range}/tcp \\\n")
+    #     f.write(
+    #         f"  -p {port_range}:{port_range}/udp \\\n")
+    #     f.write(f"  -e PORTMASTER_IP={portmaster_ip} \\\n")
+    #     f.write(f"  -e PORTMASTER_PORT=50000 \\\n")
+    #     f.write(f"  -e EXPOSED_PORT_RANGE={port_range} \\\n")
+
+    #     # Other container parameters
+    #     # Use the container name as the network name
+    #     f.write(f"  --network {network_name} \\\n")
+    #     f.write(f"  --security-opt label=disable \\\n")
+    #     f.write(
+    #         f"  amnezia-openvpn dumb-init /opt/amnezia/start.sh\n")
+    #     f.close
 
     # 7. Create config for the bash script
     config_path = os.path.join(PAYLOAD_DIR, "deploy_config.sh")

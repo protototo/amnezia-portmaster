@@ -1,21 +1,24 @@
 #!/bin/bash
 
-# Specify variables
-CONFIG_FILE="portmaster.conf"
-SERVER_IP="10.8.1.0"  # Replace with the IP of your VPN server on the TUN interface
-SERVER_PORT="50000"    # The port your portmaster listens on
-#TUN_IFACE="utun3" # The name of the TUN interface of the VPN server where portmaster is running
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+CONFIG_FILE="$SCRIPT_DIR/portmaster.conf"
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Configuration file not found."
+    exit 1
+fi
+source "$CONFIG_FILE"
+
 # Flag indicating that we are sending a request to clear all forwarded ports
 # Set in the disconnect function
 DISCONNECT_REQUEST=0
-IP="" # Determined in case of disconnect
 
 # Function to check if a string is a number
 is_number() {
     [[ "$1" =~ ^[0-9]+$ ]]
 }
 
-#add port
+# Function to add a port
+
 add_port() {
     local port="$1"
 
@@ -25,82 +28,64 @@ add_port() {
         return 1
     fi
 
-    # Check if the port is already in the configuration
-    if grep -q "PORTS:.*\b$port\b" "$CONFIG_FILE"; then
+    # Проверка, есть ли уже порт в массиве PORTS
+    if [[ " ${PORTS[*]} " =~ " $port " ]]; then 
         echo "Error: Port $port is already added."
         return 1
     fi
 
-    # If "PORTS:" line exists, append the port with a comma and space
-    if grep -q "PORTS:" "$CONFIG_FILE"; then
-        # Check if the line already contains ports
-        if grep -qE "PORTS:\s*[0-9]" "$CONFIG_FILE"; then
-            # Append the new port with a comma and space
-            sed -i.bak -E "s/(PORTS:.*[0-9])/\1, $port/" "$CONFIG_FILE"
-        else
-            # No ports listed yet, add the first port
-            sed -i.bak -E "s/(PORTS:\s*)/\1$port/" "$CONFIG_FILE"
-        fi
-    else
-        # Otherwise, create a new "PORTS:" line
-        echo "PORTS: $port" >> "$CONFIG_FILE"
-    fi
+    # Add the port to the PORTS array
+    PORTS+=("$port")
 
+   # Update the configuration file
+
+    update_config
     echo "Port $port added."
     return 0
 }
 
+update_config() {
+   echo "Updating configuration file..."
+   {
+        echo "SERVER_IP=\"$SERVER_IP\""
+        echo "SERVER_PORT=$SERVER_PORT"
+        echo "PORTS=(${PORTS[@]})"
+   } > "$CONFIG_FILE"
+}
 
+# Delete port
 delete_port() {
     local port="$1"
+    local index=-1
+    local i=0
 
-    # Читаем строку с портами из конфигурации
-    ports_line=$(grep "PORTS:" "$CONFIG_FILE")
-
-    # Извлекаем порты, удаляя все лишние пробелы и разделители
-    ports_array=($(echo "$ports_line" | sed 's/PORTS: //' | tr ',' ' '))
-
-    # Проверяем, есть ли порт в массиве, и удаляем его
-    new_ports_array=()
-    port_found=0
-    for p in "${ports_array[@]}"; do
-        if [ "$p" == "$port" ]; then
-            port_found=1
-        else
-            new_ports_array+=("$p")
+    # Находим индекс порта в массиве PORTS
+    for p in "${PORTS[@]}"; do
+        if [[ "$p" == "$port" ]]; then
+            index=$i
+            break  # Выходим из цикла после нахождения порта
         fi
+        ((i++))
     done
 
-    if [ "$port_found" -eq 0 ]; then
+    # Проверяем, найден ли порт
+    if [[ "$index" == "-1" ]]; then
         echo "Error: Port $port not found in configuration."
-        return 1  # Return 1 to indicate an error
+        return 1
     fi
 
-    # Формируем строку для конфигурации
-    if [ ${#new_ports_array[@]} -eq 0 ]; then
-        # Если массив пуст, просто оставляем PORTS: пустым
-        new_ports_line="PORTS:"
-    else
-        # Иначе соединяем порты с запятыми
-        new_ports_line="PORTS: $(IFS=','; echo "${new_ports_array[*]}")"
-    fi
+    # Удаляем порт из массива с помощью unset
+    unset PORTS["$index"]
 
     # Обновляем конфигурационный файл
-    sed -i.bak "s|$ports_line|$new_ports_line|" "$CONFIG_FILE"
+    update_config
     echo "Port $port deleted."
-    return 0
+ 
 }
 
 
-
-
-# Function asks to remove all port forwarding rules for current client
+# Function to ask to remove all port forwarding rules for the current client
 disconnect() {
-    #IP=$(ifconfig $TUN_IFACE | grep 'inet ' | awk '{print $2}')
-    #if [ -z "$IP" ]; then
-    #    echo "Error: Could not determine IP address."
-    #    return 1  # Return 1 to indicate an error
-    #fi
     DISCONNECT_REQUEST=1
     return 0  # Return 0 to indicate success
 }
@@ -145,12 +130,9 @@ if [[ "$#" > 0 ]]; then
             echo "Error: '$2' is not a valid port number."
             exit 1
         fi
-        if add_port "$2"; then
-            cat "$CONFIG_FILE" | nc "$SERVER_IP" "$SERVER_PORT"
-            # Send notification on macOS
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-                notify_mac "Port $2 added. Configuration updated."
-            fi
+        add_port "$2"
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            notify_mac "Port $2 deleted. Configuration updated."
         fi
         ;;
 
@@ -164,7 +146,6 @@ if [[ "$#" > 0 ]]; then
             exit 1
         fi
         if delete_port "$2"; then
-            cat "$CONFIG_FILE" | nc "$SERVER_IP" "$SERVER_PORT"
             # Send notification on macOS
             if [[ "$OSTYPE" == "darwin"* ]]; then
                 notify_mac "Port $2 deleted. Configuration updated."
@@ -195,17 +176,12 @@ if [[ "$#" > 0 ]]; then
   esac
 fi
 
-# Read configuration
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Configuration file not found."
-    exit 1
-fi
-
-if [[ "$DISCONNECT_REQUEST" -eq 0 ]]; then
-    response=$(cat "$CONFIG_FILE" | nc "$SERVER_IP" "$SERVER_PORT")
+if [[ $DISCONNECT_REQUEST -eq 0 ]]; then
+    REQUEST="PORTS: $(echo "${PORTS[*]}" | tr ' ' ',')"
+    response=$(echo "$REQUEST" | nc "$SERVER_IP" "$SERVER_PORT")
 else
-    #Client can send any IP as IP will be ignored, because disconnect requests to different IPs are accepted only from server
-    response=$(echo "DISCONNECT: 10.8.0.2" | nc "$SERVER_IP" "$SERVER_PORT")
+    # Client can send any IP as IP will be ignored, because disconnect requests to different IPs are accepted only from server
+    response=$(echo "$REQUEST" | nc "$SERVER_IP" "$SERVER_PORT")
     echo "Disconnect request sent."
 fi
 

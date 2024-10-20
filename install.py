@@ -25,21 +25,21 @@ PAYLOAD_EXPLANATION = {
 DEFAULT_CONTAINER_TYPE = "openvpn"
 USERNAME = ""
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
+CLIENT_CONFIG = WORK_DIR+"/client/portmaster.conf"
 PAYLOAD_DIR = WORK_DIR + "/payload"
 BACKUP_CONTAINER_NAME=""
 PORTMASTER_PORT=50000
 
-# Function for secure user input
-def get_user_input(prompt, validation_func=None, default=None, hide_input=False):
+
+def get_user_input(prompt, validation_func=None, default=None, hide_input=False, require_confirmation=False):
     """Prompts the user for data, checks it, and returns the result.
 
     Args:
         prompt (str): The prompt text for input.
-        validation_func (callable, optional): An input validation function. 
-                                                It should take a string and return True if the input is valid, otherwise False. 
-                                                By default, it is not used (any input is considered valid).
-        default (str, optional): The default value. If set, it will be displayed in brackets after the prompt.
-        hide_input (bool, optional): Whether to hide the input (used for passwords). Defaults to False.
+        validation_func (callable, optional): An input validation function.
+        default (str, optional): The default value.
+        hide_input (bool, optional): Whether to hide the input.
+        require_confirmation (bool, optional): Whether to require confirmation. Defaults to False.
 
     Returns:
         str: The user-entered data after successful validation.
@@ -56,10 +56,9 @@ def get_user_input(prompt, validation_func=None, default=None, hide_input=False)
         else:
             user_input = input(input_prompt)
 
-        # Remove spaces at the beginning and end of the string
         user_input = user_input.strip()
 
-        if not user_input and default:
+        if not user_input and default is not None:  # Важно: проверяем default на None
             user_input = default
 
         if validation_func and not validation_func(user_input):
@@ -69,11 +68,21 @@ def get_user_input(prompt, validation_func=None, default=None, hide_input=False)
         if not hide_input:
             print(f"You entered: {user_input}")
 
-        confirm = input("Confirm (Y/n): ").strip().lower()
-        if confirm in ('y', ''):
+        if require_confirmation:  # Запрашиваем подтверждение, только если require_confirmation=True
+            confirm = input("Confirm (Y/n): ").strip().lower()
+            if confirm in ('y', ''):
+                return user_input
+            else:
+                print("Input canceled. Please try again.")
+        else:  # Если require_confirmation=False, возвращаем ввод без подтверждения
             return user_input
-        else:
-            print("Input canceled. Please try again.")
+
+
+def write_client_conf(server_ip, server_port):
+    with open(CLIENT_CONFIG, "w") as f:
+        f.write(f"SERVER_IP={server_ip}")
+        f.write(f"SERVER_PORT={server_port}")
+        f.write("PORTS=()")
 
 def validate_ip_address(ip):
     """Checks the validity of the IP address.
@@ -394,6 +403,8 @@ def prepare_payload_wg(ssh, container_name, port_range, tcp_ports, udp_ports):
     except Exception as e:
         print(f"Error determining the IP address of tun0: {e}")
         exit
+
+    write_client_conf(portmaster_ip, PORTMASTER_PORT)
     
     create_container_script = os.path.join(
         PAYLOAD_DIR, "create_container.sh")
@@ -592,53 +603,12 @@ def prepare_payload_openvpn(ssh, container_name, port_range, tcp_ports, udp_port
         print(f"Error determining the IP address of tun0: {e}")
         exit
     
+    write_client_conf(portmaster_ip,PORTMASTER_PORT)
+
     #Create create_container.sh
     create_container_script = os.path.join(
         PAYLOAD_DIR, "create_container.sh")
     create_start_container_script(ssh, create_container_script, container_name, port_range, portmaster_ip, PORTMASTER_PORT)
-
-
-
-    # # 5. Get the container network name
-    # try:
-    #     _, stdout, _ = ssh.exec_command(
-    #         f"docker inspect -f '{{{{.HostConfig.NetworkMode}}}}' {container_name}")
-    #     network_name = stdout.read().decode().strip()
-    # except Exception as e:
-    #     print(f"Error getting NetworkMode: {e}")
-    #     return
-
-
-    # with open(create_container_script, "w") as f:
-    #     f.write("#!/bin/bash\n\n")
-    #     f.write(f"docker run -d \\\n")
-    #     f.write(f"  --name {container_name} \\\n")
-    #     f.write(f"  --privileged \\\n")
-    #     f.write(f"  --cap-add=NET_ADMIN \\\n")
-    #     f.write(f"  --restart always \\\n")
-
-    #     # Add port forwarding from tcp_ports, udp_ports, and port_range
-    #     for port in tcp_ports:
-    #         f.write(
-    #             f"  -p {port.split('/')[0]}:{port.split('/')[0]}/tcp \\\n")
-    #     for port in udp_ports:
-    #         f.write(
-    #             f"  -p {port.split('/')[0]}:{port.split('/')[0]}/udp \\\n")
-    #     f.write(
-    #         f"  -p {port_range}:{port_range}/tcp \\\n")
-    #     f.write(
-    #         f"  -p {port_range}:{port_range}/udp \\\n")
-    #     f.write(f"  -e PORTMASTER_IP={portmaster_ip} \\\n")
-    #     f.write(f"  -e PORTMASTER_PORT=50000 \\\n")
-    #     f.write(f"  -e EXPOSED_PORT_RANGE={port_range} \\\n")
-
-    #     # Other container parameters
-    #     # Use the container name as the network name
-    #     f.write(f"  --network {network_name} \\\n")
-    #     f.write(f"  --security-opt label=disable \\\n")
-    #     f.write(
-    #         f"  amnezia-openvpn dumb-init /opt/amnezia/start.sh\n")
-    #     f.close
 
     # 7. Create config for the bash script
     config_path = os.path.join(PAYLOAD_DIR, "deploy_config.sh")
@@ -801,14 +771,18 @@ def execute_remote_script(ssh, script_path):
 
 def main():
     """Main function of the script."""
-
+    
+    print ("The installer script will install portmaster port forwarder into AmneziaVPN container")
+    print ("Currently Amnezia OpenVPN and Amnezia WireGuard are supported")
+    print("Please proceed with SSH connecton info")
+    print ("\n")
     while True:
         # 1. Request SSH connection details
         host = get_user_input(
             "Enter the server IP address", validation_func=validate_ip_address)
         USERNAME = os.getlogin()
         USERNAME = get_user_input(
-            "Enter the SSH username", default=USERNAME)
+            "Enter the SSH username", default=USERNAME, require_confirmation=True)
 
         auth_method = get_user_input("Select authorization method (1 - by key, 2 - by password)",
                                      lambda x: x in ['1', '2'],
@@ -877,7 +851,8 @@ def main():
             validation_func=lambda x: validate_container_index(
                 x, containers),  # Pass the validation function
             default=str(
-                default_container_index) if default_container_index is not None else None
+                default_container_index) if default_container_index is not None else None,
+            require_confirmation=True
         )
         selected_container = containers[int(selected_index_str) - 1]
         container_type = DEFAULT_CONTAINERS.get(selected_container)
@@ -892,9 +867,9 @@ def main():
             print(
                 f"If you just renamed the container, specify its type.")
             print(
-                f"If you choose custom, the installer will install the scripts, run postmaster without touching the VPN server configuration.")
+                f"If you choose custom, the installer will install the scripts, run portmaster without touching the VPN server configuration.")
             print(
-                f"You can continue, the installer will install the scripts, run postmaster, and leave the ")
+                f"You can continue, the installer will install the scripts, run portmaster, and leave the ")
             selected_install_types = ["openvpn", "wireguard", "custom"]
             # Display the list
             for index, install_type in enumerate(selected_install_types):
@@ -994,6 +969,11 @@ def main():
                                 f"Directory {remote_deploy_dir} deleted.")
                     if os.path.exists(PAYLOAD_DIR) and os.path.isdir(PAYLOAD_DIR):
                         shutil.rmtree(PAYLOAD_DIR)
+                    
+                    print(f"Ports {port_range} successfully exposed in {container_name} container")
+                    print(f"You can now use portmaster-client.sh -add <port> to forward ports through VPN tunnel to your machine")
+                    print(
+                        f"You can also edit portmaster.conf to forward several ports for example PORTS=(10090 10091 10092....)")
                     print("Installation complete!")
                 else:
                     print(

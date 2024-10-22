@@ -8,6 +8,17 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 source "$CONFIG_FILE"
 
+# Преобразуем IP-адрес в вид "10.8.1." (отбрасываем последний октет)
+network_addr=$(echo "$SERVER_IP" | sed 's/\.[0-9]*$//')
+
+# Поиск сети по адресу "10.8.1." в выводе ifconfig
+if ifconfig | grep -q "$network_addr"; then
+    echo "VPN interface is up"
+else
+    echo "Couldn't find VPN interface"
+    exit
+fi
+
 # Flag indicating that we are sending a request to clear all forwarded ports
 # Set in the disconnect function
 DISCONNECT_REQUEST=0
@@ -17,8 +28,27 @@ is_number() {
     [[ "$1" =~ ^[0-9]+$ ]]
 }
 
-# Function to add a port
+# Функция для замены переменных в шаблоне plist
+function update_plist {
+    local template_file="$1"   # Путь к шаблону
+    local output_file="$2"      # Путь к выходному файлу
+    local portmaster_client="$3" # Значение для PORTMASTER_CLIENT
+    local port_master_conf="$4"  # Значение для PORT_MASTER_CONF
 
+    # Копируем шаблон в выходной файл
+    cp "$template_file" "$output_file"
+
+    # Заменяем переменные на переданные значения
+    sed -i.bak "s|\$PORTMASTER_CLIENT|$portmaster_client|g" "$output_file"
+    sed -i.bak "s|\$PORT_MASTER_CONF|$port_master_conf|g" "$output_file"
+
+    # Удаляем резервную копию, созданную sed
+    rm "$output_file.bak"
+
+    echo "Файл $output_file успешно обновлен."
+}
+
+# Function to add a port
 add_port() {
     local port="$1"
 
@@ -117,6 +147,56 @@ test_port_forwarding() {
     echo "Test completed."
 }
 
+uninstall_agent(){
+   echo "Portmaster agent will be uninstalled"
+    read -p "Do you want to continue? (y/N):" answer
+    answer=${answer:-N}
+    case "$answer" in
+        [Yy]* )            
+            OUTPUT_FILE="$SCRIPT_DIR/mac/portmaster_agent.plist"                        
+            launchctl unload -w $OUTPUT_FILE
+            exit
+            ;;
+        [Nn]* )
+            echo "Uninstalation aborted."
+            exit
+            ;;
+        * )
+            echo "Please, Y or N"
+            install_agent  # Рекурсивный вызов функции для повторного запроса
+            ;;
+    esac
+
+}
+
+install_agent() {
+    echo "Client will install MacOS portmaster agent so you don't need to run portmaster-client every time you connect to VPN server."
+    echo "The agent will only run when you connect to VPN or edit and save portmaster.conf"
+    echo "You can easyly remove agent by running portmaster-client.sh --uninstall"
+    read -p "Do you want to continue? (y/N):" answer
+    answer=${answer:-N}
+    case "$answer" in
+        [Yy]* )
+            echo "Installing..."
+            TEMPLATE_FILE="$SCRIPT_DIR/mac/agent_template.plist"
+            OUTPUT_FILE="$SCRIPT_DIR/mac/portmaster_agent.plist"
+            PORTMASTER_CLIENT="$SCRIPT_DIR/portmaster-client.sh"
+            update_plist $TEMPLATE_FILE $OUTPUT_FILE $PORTMASTER_CLIENT $CONFIG_FILE
+            launchctl load -w $OUTPUT_FILE
+            echo "Installed!"
+            echo "You can easyly remove agent by running portmaster-client.sh --uninstall"            
+            ;;
+        [Nn]* )
+            echo "Instalation aborted."
+            exit
+            ;;
+        * )
+            echo "Please, Y or N"
+            install_agent  # Рекурсивный вызов функции для повторного запроса
+            ;;
+    esac
+}
+
 # Check arguments
 if [[ "$#" > 0 ]]; then
   # Handle arguments
@@ -168,6 +248,9 @@ if [[ "$#" > 0 ]]; then
         fi
         test_port_forwarding "$2"
         ;;
+    --install)
+        install_agent
+        ;;
 
     *)
         echo "Error: Invalid argument '$1'. Valid arguments: --add, --delete, --disconnect, --test."
@@ -178,7 +261,7 @@ fi
 
 if [[ $DISCONNECT_REQUEST -eq 0 ]]; then
     REQUEST="PORTS: $(echo "${PORTS[*]}" | tr ' ' ',')"
-    response=$(echo "$REQUEST" | nc "$SERVER_IP" "$SERVER_PORT")
+    response=$(echo "$REQUEST" | nc -w1  "$SERVER_IP" "$SERVER_PORT")
 else
     # Client can send any IP as IP will be ignored, because disconnect requests to different IPs are accepted only from server
     response=$(echo "$REQUEST" | nc "$SERVER_IP" "$SERVER_PORT")

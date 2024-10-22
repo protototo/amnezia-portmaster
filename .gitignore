@@ -2,3 +2,5 @@
 /.vscode
 /build
 /dist
+*.7z
+/portmaster-win

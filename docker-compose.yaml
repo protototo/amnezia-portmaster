@@ -1,7 +1,7 @@
 services:
   portmaster:
     build: .
-    container_name: portmaster-ovpn
+    container_name: portmaster
     restart: always
     cap_add:
       - NET_ADMIN

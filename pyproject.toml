@@ -1,0 +1,21 @@
+[project]
+name = "amnezia-portmaster"
+version = "0.1.0"
+description = "PortMaster for amnezia vpn"
+authors = [
+    { name = "pro_to", email = "end0rfin@protonmail.com" },
+]
+requires-python = ">=3.12"
+dependencies = [
+    "flet",
+    "flet-desktop>=0.25.2",
+    "paramiko",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "black",
+]
+
+[tool.uv]

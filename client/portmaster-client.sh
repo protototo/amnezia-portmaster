@@ -9,15 +9,15 @@ fi
 source "$CONFIG_FILE"
 
 # Преобразуем IP-адрес в вид "10.8.1." (отбрасываем последний октет)
-network_addr=$(echo "$SERVER_IP" | sed 's/\.[0-9]*$//')
+#network_addr=$(echo "$SERVER_IP" | sed 's/\.[0-9]*$//')
 
 # Поиск сети по адресу "10.8.1." в выводе ifconfig
-if ifconfig | grep -q "$network_addr"; then
-    echo "VPN interface is up"
-else
-    echo "Couldn't find VPN interface"
-    exit
-fi
+#if ifconfig | grep -q "$network_addr"; then
+#    echo "VPN interface is up"
+#else
+#    echo "Couldn't find VPN interface"
+#    exit
+#fi
 
 # Flag indicating that we are sending a request to clear all forwarded ports
 # Set in the disconnect function
@@ -172,7 +172,7 @@ uninstall_agent(){
 install_agent() {
     echo "Client will install MacOS portmaster agent so you don't need to run portmaster-client every time you connect to VPN server."
     echo "The agent will only run when you connect to VPN or edit and save portmaster.conf"
-    echo "You can easyly remove agent by running portmaster-client.sh --uninstall"
+    echo "You can easily remove agent by running portmaster-client.sh --uninstall"
     read -p "Do you want to continue? (y/N):" answer
     answer=${answer:-N}
     case "$answer" in

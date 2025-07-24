@@ -1,6 +1,6 @@
-
-/.vscode
-/build
-/dist
+.venv
+.vscode
+./build
+./dist
 *.7z
-/portmaster-win
+./portmaster-win

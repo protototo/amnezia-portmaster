@@ -8,6 +8,7 @@ import socket
 import flet as ft
 import paramiko
 import os
+from fluent.runtime import FluentLocalization, FluentResourceLoader
 
 # --- КОНФИГУРАЦИЯ ---
 GIT_REPO_URL = "https://github.com/protototo/amnezia-portmaster.git"
@@ -73,6 +74,53 @@ def find_default_ssh_key() -> str | None:
             if key_path.is_file():
                 return str(key_path)  # Возвращаем путь как строку
     return None
+
+
+class L10nManager:
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if not cls._instance:
+            cls._instance = super(L10nManager, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self, fallback_locale="en"):
+        if hasattr(self, 'initialized'):
+            return
+        self.initialized = True
+
+        self.loader = FluentResourceLoader("locales/{locale}")
+        self.fallback_locale = fallback_locale
+        self.locales = {}
+        self._discover_locales()
+        self.current_locale = fallback_locale
+        if "ru" in self.locales:  # Делаем русский дефолтным, если он есть
+            self.current_locale = "ru"
+
+    def _discover_locales(self):
+        locales_path = pathlib.Path("locales")
+        if not locales_path.is_dir():
+            return
+        for locale_dir in locales_path.iterdir():
+            if locale_dir.is_dir():
+                self.locales[locale_dir.name] = FluentLocalization([locale_dir.name, self.fallback_locale],
+                                                                   ["main.ftl"], self.loader)
+
+    def set_locale(self, locale: str):
+        if locale in self.locales:
+            self.current_locale = locale
+
+    def get(self, key: str, **kwargs) -> str:
+        """Получает переведенную строку по ключу."""
+        if self.current_locale not in self.locales:
+            return key  # Возвращаем ключ, если локаль не найдена
+
+        bundle = self.locales[self.current_locale]
+        message = bundle.format_value(key, args=kwargs)
+        return message if message else key
+
+    def get_available_locales(self):
+        return list(self.locales.keys())
 
 
 # --- SSH-клиент (Финальная рабочая версия) ---
@@ -199,7 +247,6 @@ class InstallationService:
             # 2. Парсим вывод в Python
             for line in status_output.splitlines():
                 if UFW_RULE_COMMENT in line:
-                    # Ищем номер правила в квадратных скобках
                     match = re.search(r"\[\s*(\d+)\s*\]", line)
                     if match:
                         rule_number = int(match.group(1))

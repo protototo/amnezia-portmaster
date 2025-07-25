@@ -1,3 +1,5 @@
+import pathlib
+import pwd
 import re
 import threading
 from typing import Callable
@@ -34,9 +36,42 @@ def show_monkey_with_grenade_dialog(page: ft.Page, dangerous_path: str):
                                 size=14, text_align=ft.TextAlign.CENTER), actions=[
             ft.ElevatedButton("Понял", on_click=close_dialog, color=ft.Colors.WHITE, bgcolor=ft.Colors.RED_700)],
                             actions_alignment=ft.MainAxisAlignment.END)
-    page.dialog = dialog
-    dialog.open = True
+    #page.dialog = dialog
     page.update()
+    page.open(dialog)
+
+
+# --- Утилиты для умных дефолтов ---
+def get_current_username() -> str | None:
+    """
+    Возвращает имя текущего пользователя.
+    Использует самый надежный метод для Unix-систем (включая macOS).
+    """
+    # Проверяем, что мы не на Windows
+    if os.name == 'posix':
+        try:
+            # Это самый надежный способ, который работает даже из IDE
+            return pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            # Крайне редкий случай, если UID не найден в базе пользователей
+            return None
+    return None
+
+
+def find_default_ssh_key() -> str | None:
+    """Ищет стандартный SSH ключ (id_rsa или id_ed25519) в ~/.ssh/"""
+    if os.name == 'posix':
+        home_dir = pathlib.Path.home()
+        ssh_dir = home_dir / ".ssh"
+
+        # Список стандартных имен ключей для проверки
+        default_keys = ["id_ed25519", "id_rsa"]
+
+        for key_name in default_keys:
+            key_path = ssh_dir / key_name
+            if key_path.is_file():
+                return str(key_path)  # Возвращаем путь как строку
+    return None
 
 
 # --- SSH-клиент (Финальная рабочая версия) ---
@@ -199,11 +234,14 @@ class InstallerApp:
         self.page = page
         page.title = "Установщик Amnezia Portmaster"
 
+        default_user = get_current_username()
+        default_key_path = find_default_ssh_key()
+
         self.host = ft.TextField(label="Host/IP", expand=True)
         self.port = ft.TextField(label="SSH Port", value="22", width=120)
-        self.user = ft.TextField(label="User", value="root", expand=True)
+        self.user = ft.TextField(label="User", value=default_user if default_user else "root", expand=True)
         self.password = ft.TextField(label="Пароль пользователя", password=True, can_reveal_password=True, expand=True)
-        self.key_path = ft.TextField(label="Путь к приватному SSH ключу", read_only=True, expand=True)
+        self.key_path = ft.TextField(label="Путь к приватному SSH ключу", value=default_key_path, read_only=True, expand=True)
         self.key_password = ft.TextField(label="Пароль от SSH ключа (если есть)", password=True,
                                          can_reveal_password=True)
         self.key_picker = ft.FilePicker(on_result=self._on_key_picked)
@@ -211,7 +249,7 @@ class InstallerApp:
         self.pick_btn = ft.ElevatedButton(
             "Выбрать ключ",
             icon=ft.Icons.FOLDER_OPEN,
-            on_click=lambda _: self.key_picker.pick_files(dialog_title="Выберите приватный ключ"),
+            on_click=lambda _: self.key_picker.pick_files(dialog_title="Выберите приватный ключ",allow_multiple=False),
             style=ft.ButtonStyle(
                 padding=ft.padding.symmetric(vertical=15, horizontal=15),
             )
@@ -221,8 +259,16 @@ class InstallerApp:
                                              style=ft.ButtonStyle(padding=ft.padding.symmetric(vertical=20, horizontal=20),
             ))
         self.progress = ft.ProgressRing(visible=False)
-        self.copy_log_btn = ft.IconButton(icon=ft.Icons.COPY, tooltip="Скопировать лог",
-                                          on_click=self._copy_log_to_clipboard)
+        self.copy_log_btn = ft.IconButton(
+            icon=ft.Icons.COPY,
+            tooltip="Скопировать лог",
+            on_click=self._copy_log_to_clipboard,
+            # Задаем стиль, чтобы убрать лишние отступы
+            style=ft.ButtonStyle(
+                padding=0  # Нулевые внутренние отступы для максимальной компактности
+            ),
+            icon_size=16 # Опционально можно чуть уменьшить и саму иконку
+        )
         self.pm_service_port = ft.TextField(
             label="Порт сервиса Portmaster",
             value="5000",
@@ -428,11 +474,12 @@ class InstallerApp:
                     # --- КОЛОНКА 3: Лог (справа) ---
                     ft.Column(
                         expand=True,  # Эта колонка займет все оставшееся место
+                        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                         controls=[
-                            ft.Row([
+                            ft.Row(controls=[
                                 ft.Text("Лог выполнения", size=18, weight=ft.FontWeight.BOLD),
                                 self.copy_log_btn
-                            ]),
+                            ],vertical_alignment=ft.CrossAxisAlignment.CENTER),
                             ft.Container(
                                 content=self.log_output_column,
                                 border=None,

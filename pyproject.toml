@@ -7,8 +7,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "flet",
-    "flet-desktop>=0.25.2",
+    "flet[all]==0.28.2",
     "paramiko",
 ]
 

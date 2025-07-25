@@ -162,32 +162,6 @@ class InstallationService:
             self.log("✅ Предыдущих установок не найдено.")
             return False
 
-    def _cleanup_previous_installation(self):
-        """Останавливает и удаляет старый контейнер и его правила UFW."""
-        self.log("Начало очистки предыдущей установки...")
-        use_sudo = self.data['user'] != 'root'
-
-        # 1. Удаляем контейнер
-        self.log(f"Остановка и удаление контейнера '{CONTAINER_NAME}'...")
-        # `docker stop ... || true` - чтобы команда не падала, если контейнер уже остановлен
-        cleanup_command = f"docker stop {CONTAINER_NAME} || true && docker rm {CONTAINER_NAME}"
-        self._execute(cleanup_command, use_sudo=use_sudo)
-
-        # 2. Удаляем правило UFW
-        self.log("Поиск и удаление старых правил UFW...")
-        # Эта команда находит номер правила по нашему комментарию и передает его в `ufw delete`
-        # `yes | ...` автоматически отвечает "y" на запрос подтверждения от `ufw delete`
-        ufw_cleanup_command = (
-                "UFW_RULE_NUM=$(sudo ufw status numbered | grep -E \"'" + UFW_RULE_COMMENT + "'\" | awk -F'[][]' '{print $2}') && "
-                                                                                             "[ -n \"$UFW_RULE_NUM\" ] && sudo ufw --force delete $UFW_RULE_NUM"
-        )
-        try:
-            self._execute(ufw_cleanup_command, use_sudo=True)
-            self.log("✅ Старые артефакты успешно удалены.")
-        except ChildProcessError as e:
-            # Не страшно, если команда упала - возможно, правила и не было
-            self.log("Не удалось найти или удалить правило UFW (возможно, его и не было).")
-
     def _execute(self, command: str, use_sudo=False, working_dir: str | None = None):
         """
         Собирает и выполняет команду, ПРАВИЛЬНО обрабатывая `cd` и `sudo`.
@@ -212,6 +186,63 @@ class InstallationService:
 
         # Выполняем собранную команду
         return self.client.execute_command(command_to_run, self.log, sudo_password=password_for_sudo)
+
+    def _cleanup_ufw_rules(self):
+        """Находит все правила UFW по комментарию и удаляет их в правильном порядке."""
+        self.log("Поиск и удаление старых правил UFW...")
+
+        try:
+            # 1. Получаем полный статус файрвола
+            status_output = self._execute("sudo ufw status numbered", use_sudo=True)
+
+            rules_to_delete = []
+            # 2. Парсим вывод в Python
+            for line in status_output.splitlines():
+                if UFW_RULE_COMMENT in line:
+                    # Ищем номер правила в квадратных скобках
+                    match = re.search(r"\[\s*(\d+)\s*\]", line)
+                    if match:
+                        rule_number = int(match.group(1))
+                        rules_to_delete.append(rule_number)
+
+            if not rules_to_delete:
+                self.log("✅ Правил UFW, созданных установщиком, не найдено.")
+                return
+
+            # 3. Сортируем номера в ОБРАТНОМ порядке для безопасного удаления
+            rules_to_delete.sort(reverse=True)
+            self.log(f"Обнаружены правила для удаления: {rules_to_delete}")
+
+            # 4. Удаляем каждое правило по очереди
+            for num in rules_to_delete:
+                self.log(f"Удаление правила UFW номер {num}...")
+                # --force используется, чтобы избежать интерактивного запроса "y/n"
+                self._execute(f"sudo ufw --force delete {num}", use_sudo=True)
+
+            self.log("✅ Старые правила UFW успешно удалены.")
+
+        except ChildProcessError:
+            self.log("⚠️ Команда `ufw` не найдена или неактивна. Пропускаем очистку правил.")
+        except Exception as e:
+            self.log(f"❌ Произошла ошибка при очистке правил UFW: {e}")
+
+    def _cleanup_previous_installation(self):
+        """Останавливает и удаляет старый контейнер и его правила UFW."""
+        self.log("Начало очистки предыдущей установки...")
+        use_sudo = self.data['user'] != 'root'
+
+        # 1. Удаляем контейнер
+        self.log(f"Остановка и удаление контейнера '{CONTAINER_NAME}'...")
+        cleanup_command = f"docker stop {CONTAINER_NAME} || true && docker rm {CONTAINER_NAME}"
+        try:
+            self._execute(cleanup_command, use_sudo=use_sudo)
+        except ChildProcessError:
+            # Не страшно, если упало, возможно контейнера и не было
+            self.log(f"Не удалось удалить контейнер '{CONTAINER_NAME}' (возможно, его не было).")
+
+        # 2. Вызываем новый надежный метод для очистки UFW
+        self._cleanup_ufw_rules()
+
 
     def _ensure_port_is_open(self):
         """Проверяет доступность порта с клиента и открывает его в UFW при необходимости."""
@@ -314,6 +345,20 @@ class InstallationService:
         self._execute(sed_command)
         self.log("✅ docker-compose.yml успешно настроен.")
 
+    def run_uninstallation(self):
+        """Запускает процесс полного удаления Portmaster с сервера."""
+        self.log("\n--- Начало процесса удаления ---")
+        try:
+            if not self._check_for_existing_installation():
+                self.log("Нечего удалять. Установка Portmaster не найдена.")
+                self.log("✅ --- Процесс удаления завершен --- ✅")
+                return
+
+            self._cleanup_previous_installation()
+            self.log("✅ --- Процесс удаления успешно завершен --- ✅")
+
+        except Exception as e:
+            self.log(f"\n--- ❌ ОШИБКА ПРИ УДАЛЕНИИ ---\n{type(e).__name__}: {e}")
 
     def run_installation(self):
         try:
@@ -383,6 +428,16 @@ class InstallationService:
         self._execute(f"chmod +x {script_path}", working_dir=remote_path)
         self._execute(script_path, use_sudo=use_sudo, working_dir=remote_path)
 
+    def run_fix_routes(self):
+        """Запускает процесс повторного применения сетевых правил."""
+        self.log("\n--- Начало процесса восстановления маршрутов ---")
+        try:
+            # Просто вызываем существующий, отлаженный метод
+            self._apply_network_rules()
+            self.log("✅ --- Маршруты успешно восстановлены --- ✅")
+        except Exception as e:
+            self.log(f"\n--- ❌ ОШИБКА ПРИ ВОССТАНОВЛЕНИИ ---\n{type(e).__name__}: {e}")
+
 
 # --- Главное приложение (UI) ---
 class InstallerApp:
@@ -407,15 +462,51 @@ class InstallerApp:
         self.pick_btn = ft.ElevatedButton(
             "Выбрать ключ",
             icon=ft.Icons.FOLDER_OPEN,
+            width=180,
             on_click=lambda _: self.key_picker.pick_files(dialog_title="Выберите приватный ключ",allow_multiple=False),
             style=ft.ButtonStyle(
+                shape=ft.RoundedRectangleBorder(radius=4),
                 padding=ft.padding.symmetric(vertical=15, horizontal=15),
             )
         )
         self.log_output_column = ft.Column(spacing=5, expand=True, scroll=ft.ScrollMode.ADAPTIVE)
-        self.install_btn = ft.ElevatedButton("Установить", icon=ft.Icons.ROCKET_LAUNCH, on_click=self._on_install,
-                                             style=ft.ButtonStyle(padding=ft.padding.symmetric(vertical=20, horizontal=20),
-            ))
+        self.install_btn = ft.ElevatedButton(
+            "Установить",
+            icon=ft.Icons.ROCKET_LAUNCH,
+            on_click=self._on_install,
+            width=130,
+            style=ft.ButtonStyle(
+                shape=ft.RoundedRectangleBorder(radius=4),  # Оставляем скругление
+                bgcolor=ft.Colors.GREEN_700,
+                color=ft.Colors.WHITE,
+            )
+        )
+
+        self.fix_btn = ft.ElevatedButton(
+            "Исправить",
+            icon=ft.Icons.HEALING,
+            on_click=self._on_fix_routes,
+            tooltip="Применить сетевые правила повторно, если они сбросились после рестарта контейнеров или хоста",
+            width=130,
+            style=ft.ButtonStyle(
+                shape=ft.RoundedRectangleBorder(radius=4),  # Оставляем скругление
+                bgcolor=ft.Colors.BLUE_700,
+                color=ft.Colors.WHITE,
+            )
+        )
+
+        self.delete_btn = ft.ElevatedButton(
+            "Удалить",
+            icon=ft.Icons.DELETE_FOREVER,
+            width=130,
+            on_click=self._on_delete,
+            style=ft.ButtonStyle(
+                shape=ft.RoundedRectangleBorder(radius=4),  # Оставляем скругление
+                bgcolor=ft.Colors.RED_700,
+                color=ft.Colors.WHITE,
+            )
+        )
+
         self.progress = ft.ProgressRing(visible=False)
         self.copy_log_btn = ft.IconButton(
             icon=ft.Icons.COPY,
@@ -480,12 +571,126 @@ class InstallerApp:
             self.page.update()
 
     def _lock_ui(self, lock: bool):
-        for ctl in (self.install_btn, self.host, self.port, self.user, self.password, self.pick_btn, self.key_path,
-                    self.key_password):
+        # --- ДОБАВЛЯЕМ НОВУЮ КНОПКУ В БЛОКИРОВКУ ---
+        for ctl in (self.install_btn, self.delete_btn, self.fix_btn, self.host, self.port,
+                    self.user, self.password, self.pick_btn, self.key_path,
+                    self.key_password, self.pm_service_port, self.pm_pool_start, self.pm_pool_end):
             ctl.disabled = lock
         self.progress.visible = lock
         self.copy_log_btn.disabled = lock
         self.page.update()
+
+    def _on_fix_routes(self, e):
+        self.log_output_column.controls.clear()
+        self.page.update()
+        # Для этой операции нам нужны только данные для подключения
+        if not self.host.value or not self.port.value.isdigit() or not self.user.value:
+            self._log("❌ Ошибка: Для восстановления маршрутов необходимо заполнить поля Host/IP, Port и User.")
+            return
+        if not self.key_path.value and not self.password.value:
+            self._log("❌ Ошибка: Укажите пароль или ключ для подключения к серверу.")
+            return
+
+        self._lock_ui(True)
+        threading.Thread(target=self._fix_routes_thread_entrypoint, daemon=True).start()
+
+    def _fix_routes_thread_entrypoint(self):
+        client = SecureSSHClient()
+        try:
+            self._log(f"Подключение к {self.user.value}@{self.host.value}:{self.port.value}...")
+            client.connect(
+                hostname=self.host.value.strip(), port=int(self.port.value.strip()),
+                username=self.user.value.strip(),
+                password=self.password.value if not self.key_path.value else None,
+                key_filename=self.key_path.value or None,
+                key_password=self.key_password.value or None
+            )
+            self._log("✅ Подключение успешно установлено!")
+
+            user_data = {'user': self.user.value.strip(), 'password': self.password.value}
+
+            # Создаем сервис и вызываем НОВЫЙ метод
+            service = InstallationService(client=client, user_data=user_data, log_callback=self._log,confirmation_queue=None, request_confirmation_func=None)
+            service.run_fix_routes()
+
+        except Exception as ex:
+            self._log(f"\n--- ❌ КРИТИЧЕСКАЯ ОШИБКА ---\n{type(ex).__name__}: {ex}")
+        finally:
+            client.close()
+            self._lock_ui(False)
+
+    def _on_delete(self, e):
+        self.log_output_column.controls.clear()
+        self.page.update()
+        # Для удаления нам нужны только данные для подключения
+        if not self.host.value or not self.port.value.isdigit() or not self.user.value:
+            self._log("❌ Ошибка: Для удаления необходимо заполнить поля Host/IP, Port и User.")
+            return
+        if not self.key_path.value and not self.password.value:
+            self._log("❌ Ошибка: Укажите пароль или ключ для подключения к серверу.")
+            return
+
+        self._lock_ui(True)
+        threading.Thread(target=self._uninstallation_thread_entrypoint, daemon=True).start()
+
+    def _request_delete_confirmation(self):
+        """Показывает строгий диалог подтверждения удаления."""
+        def close_dialog(e, confirmed: bool):
+            self.confirmation_queue.put(confirmed)
+            self.page.dialog.open = False
+            self.page.update()
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("⚠️ Подтвердите удаление"),
+            content=ft.Text(
+                f"Вы уверены, что хотите НАВСЕГДА удалить контейнер '{CONTAINER_NAME}' и все связанные с ним правила файрвола с сервера?\n\nЭто действие необратимо."
+            ),
+            actions=[
+                ft.TextButton("Отмена", on_click=lambda e: close_dialog(e, False)),
+                ft.ElevatedButton("Да, я уверен, удалить", on_click=lambda e: close_dialog(e, True), color=ft.Colors.WHITE, bgcolor=ft.Colors.RED_900),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.dialog = dialog
+        self.page.update()
+        self.page.open(dialog)
+
+    def _uninstallation_thread_entrypoint(self):
+        client = SecureSSHClient()
+        try:
+            # 1. Запрашиваем подтверждение ПЕРЕД подключением
+            self._log("Требуется подтверждение на удаление...")
+            self._request_delete_confirmation()
+            if not self.confirmation_queue.get():
+                self._log("Операция удаления отменена пользователем.")
+                return
+
+            # 2. Теперь подключаемся
+            self._log(f"Подключение к {self.user.value}@{self.host.value}:{self.port.value}...")
+            client.connect(
+                hostname=self.host.value.strip(), port=int(self.port.value.strip()),
+                username=self.user.value.strip(),
+                password=self.password.value if not self.key_path.value else None,
+                key_filename=self.key_path.value or None,
+                key_password=self.key_password.value or None
+            )
+            self._log("✅ Подключение успешно установлено!")
+
+            user_data = {'user': self.user.value.strip(), 'password': self.password.value}
+
+            # 3. Создаем сервис и вызываем НОВЫЙ метод
+            service = InstallationService(
+                client=client, user_data=user_data, log_callback=self._log,
+                request_confirmation_func=None, confirmation_queue=None
+            )
+            service.run_uninstallation()
+
+        except Exception as ex:
+            self._log(f"\n--- ❌ КРИТИЧЕСКАЯ ОШИБКА ---\n{type(ex).__name__}: {ex}")
+        finally:
+            client.close()
+            self._lock_ui(False)
 
     def _validate_inputs(self) -> bool:
         if not self.host.value or not self.port.value.isdigit() or not self.user.value:
@@ -652,11 +857,43 @@ class InstallerApp:
                                     padding=20
                                 )
                             ),
-                            # Контейнер для кнопки установки в самом низу
+                            # Контейнер для кнопок в самом низу
                             ft.Container(
-                                content=ft.Row([self.install_btn, self.progress]),
-                                padding=ft.padding.all(10),
-                                alignment=ft.alignment.bottom_right
+                                content=ft.Row(
+                                    controls=[
+                                        # Контейнер для кнопки "Установить"
+                                        ft.Container(
+                                            content=self.install_btn,
+                                            expand=True,  # Занимает все доступное место (пропорционально)
+                                            height=60,  # Задаем фиксированную высоту для всех кнопок
+                                            alignment=ft.alignment.center,
+                                        ),
+                                        # Контейнер для кнопки "Удалить"
+                                        ft.Container(
+                                            content=self.delete_btn,
+                                            expand=True,  # Занимает все доступное место (пропорционально)
+                                            height=60,  # Задаем фиксированную высоту для всех кнопок
+                                            alignment=ft.alignment.center,
+                                        ),
+                                        ft.Container(
+                                            content=self.fix_btn,
+                                            expand=True,  # Занимает все доступное место (пропорционально)
+                                            height=60,  # Задаем фиксированную высоту для всех кнопок
+                                            alignment=ft.alignment.center,
+                                        ),
+                                        # Контейнер для индикатора прогресса
+                                        ft.Container(
+                                            content=self.progress,
+                                            width=60,  # Фиксированная ширина, чтобы не влиять на кнопки
+                                            height=60,
+                                            alignment=ft.alignment.center,
+                                        )
+                                    ],
+                                    spacing=10,
+                                    vertical_alignment=ft.CrossAxisAlignment.CENTER
+                                ),
+                                alignment=ft.alignment.center,
+                                padding=ft.padding.only(top=10, left=10, right=10, bottom=10),
                             )
                         ]
                     ),

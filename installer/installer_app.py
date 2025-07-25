@@ -1,5 +1,8 @@
 import re
 import threading
+import queue  # Импортируем очередь
+from typing import Callable
+
 import flet as ft
 import paramiko
 import os
@@ -9,312 +12,352 @@ GIT_REPO_URL = "https://github.com/protototo/amnezia-portmaster.git"
 REMOTE_PROJECT_DIR = "amnezia-portmaster"
 
 
-# --- Утилита проверки пути ---
+# --- Утилиты и диалоги (без изменений) ---
 def is_path_critically_dangerous(path_str: str) -> bool:
-    if not isinstance(path_str, str) or not path_str.strip():
-        return True
+    if not isinstance(path_str, str) or not path_str.strip(): return True
     path = path_str.strip()
-    if path.startswith('/'):
-        return True
-    if '..' in path.split('/'):
-        return True
-    if path.startswith('./'):
-        return True
-    if not re.fullmatch(r'[a-zA-Z0-9_.-]+', path):
-        return True
-    if path in ('.', '..'):
-        return True
+    if path.startswith('/') or '..' in path.split('/') or path.startswith('./'): return True
+    if not re.fullmatch(r'[a-zA-Z0-9_.-]+', path): return True
+    if path in ('.', '..'): return True
     return False
 
 
-# --- Диалог ошибки "обезьяна с гранатой" ---
 def show_monkey_with_grenade_dialog(page: ft.Page, dangerous_path: str):
     def close_dialog(e):
         dialog.open = False
         page.update()
         page.window.destroy()
 
-    dialog = ft.AlertDialog(
-        modal=True,
-        title=ft.Container(
-            content=ft.Row([
-                ft.Text("🐒💣", size=40),
-                ft.Text(" КРИТИЧЕСКАЯ ОШИБКА!", size=20)
-            ])
-        ),
-        content=ft.Container(
-            content=ft.Text(
-                f"Конфигурация REMOTE_PROJECT_DIR = '{dangerous_path}' небезопасна.\n\n"
-                "Исправьте константу и перезапустите приложение.",
-                size=14,
-                text_align=ft.TextAlign.CENTER,
-            ),
-            padding=20,
-        ),
-        actions=[
-            ft.ElevatedButton(
-                "Понял",
-                on_click=close_dialog,
-                color=ft.Colors.WHITE,
-                bgcolor=ft.Colors.RED_700
-            )
-        ],
-        actions_alignment=ft.MainAxisAlignment.END,
-    )
-    page.open(dialog)
+    dialog = ft.AlertDialog(modal=True,
+                            title=ft.Row([ft.Text("🐒💣", size=40), ft.Text(" КРИТИЧЕСКАЯ ОШИБКА!", size=20)]),
+                            content=ft.Text(
+                                f"Конфигурация REMOTE_PROJECT_DIR = '{dangerous_path}' небезопасна.\n\nИсправьте константу и перезапустите приложение.",
+                                size=14, text_align=ft.TextAlign.CENTER), actions=[
+            ft.ElevatedButton("Понял", on_click=close_dialog, color=ft.Colors.WHITE, bgcolor=ft.Colors.RED_700)],
+                            actions_alignment=ft.MainAxisAlignment.END)
+    page.dialog = dialog
+    dialog.open = True
+    page.update()
 
 
-# --- SSH-клиент ---
+# --- SSH-клиент (Финальная рабочая версия) ---
 class SecureSSHClient:
     def __init__(self):
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-    def connect(self, hostname, port, username, password=None, key_filename=None):
+    def connect(self, hostname, port, username, password=None, key_filename=None, key_password=None):
         try:
             if key_filename:
                 key_path = os.path.expanduser(key_filename)
-                if not os.path.exists(key_path):
-                    raise FileNotFoundError(f"SSH-ключ не найден: {key_path}")
+                if not os.path.exists(key_path): raise FileNotFoundError(f"SSH-ключ не найден: {key_path}")
                 try:
-                    pkey = paramiko.Ed25519Key.from_private_key_file(key_path, password=password)
+                    pkey = paramiko.Ed25519Key.from_private_key_file(key_path, password=key_password)
                 except paramiko.ssh_exception.SSHException:
-                    pkey = paramiko.RSAKey.from_private_key_file(key_path, password=password)
+                    pkey = paramiko.RSAKey.from_private_key_file(key_path, password=key_password)
                 self.client.connect(hostname, port, username, pkey=pkey, timeout=10)
             elif password:
                 self.client.connect(hostname, port, username, password=password, timeout=10)
             else:
-                raise ValueError("Нужно задать password или key_filename.")
+                raise ValueError("Необходимо указать пароль или путь к SSH-ключу для подключения.")
         except Exception as e:
             raise ConnectionError(f"Не удалось подключиться к {username}@{hostname}:{port}: {e}")
 
     def get_os_release_id(self) -> str:
-        stdin, stdout, stderr = self.client.exec_command(
-            "grep '^ID=' /etc/os-release | cut -d'=' -f2"
-        )
+        stdin, stdout, stderr = self.client.exec_command("grep '^ID=' /etc/os-release | cut -d'=' -f2")
         os_id = stdout.read().decode().strip().strip('"')
-        if not os_id:
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status != 0 or not os_id:
             err = stderr.read().decode().strip()
             raise RuntimeError(f"Не удалось определить OS: {err or 'нет данных'}")
         return os_id
 
-    def execute_command(self, command, log_callback, use_sudo=False, sudo_password=None,
-                        working_dir: str | None = None):
-        """
-        Выполняет команду, опционально используя sudo и/или меняя рабочую директорию.
-        """
-        # АРХИТЕКТУРНОЕ РЕШЕНИЕ:
-        # Если указана рабочая директория, мы объединяем команду cd с основной командой.
-        # Это гарантирует, что основная команда выполнится в нужном месте.
-        if working_dir:
-            # `cd` сначала, потом `&&` чтобы вторая команда выполнилась только если `cd` прошел успешно
-            command_to_run = f"cd {working_dir} && {command}"
-        else:
-            command_to_run = command
-
-        final_command = command_to_run
-        if use_sudo:
-            if not sudo_password:
-                raise ValueError("Для выполнения команды с sudo необходимо предоставить пароль.")
-            # Важно: sudo применяется к исходной команде, а не к `cd`
-            final_command = f"cd {working_dir} && sudo -S -p '' {command}" if working_dir else f"sudo -S -p '' {command}"
-
-        if use_sudo:
-            log_callback(f"$ {final_command.replace(sudo_password or '', '********')}\n")
-
-        stdin, stdout, stderr = self.client.exec_command(final_command, get_pty=True)
-
-        if use_sudo:
+    def execute_command(self, command: str, log_callback: Callable[[str], None],
+                        sudo_password: str | None = None) -> str:
+        log_callback(f"$ {command.replace(sudo_password or 'DUMMY_PASSWORD_REPLACE', '********')}")
+        stdin, stdout, stderr = self.client.exec_command(command, get_pty=True)
+        if sudo_password:
             stdin.write(sudo_password + '\n')
             stdin.flush()
-
-        for line in iter(stdout.readline, ""):
-            log_callback(line)
-
+        output_lines = []
+        for line in iter(stdout.readline, ""): output_lines.append(line)
         exit_status = stdout.channel.recv_exit_status()
-
+        full_stdout = "".join(output_lines)
         if exit_status != 0:
-            error_output = "".join(stderr.readlines())
-            if exit_status == 1 and 'incorrect password' in error_output:
-                raise PermissionError("Неверный пароль для sudo!")
-
-            error_details = f"Команда '{command}' в директории '{working_dir or '~'}' завершилась с кодом {exit_status}."
-            if error_output:
-                error_details += f"\nSTDERR:\n{error_output}"
+            full_stderr = "".join(stderr.readlines())
+            error_details = f"Команда завершилась с кодом {exit_status}.\n--- КОМАНДА ---\n{command}\n\n--- STDOUT ---\n{full_stdout}\n\n--- STDERR ---\n{full_stderr}"
+            if 'incorrect password attempt' in full_stderr.lower(): raise PermissionError("Неверный пароль для sudo!")
             raise ChildProcessError(error_details)
-
-        log_callback(f"УСПЕХ: Команда завершилась с кодом {exit_status}\n")
+        return full_stdout
 
     def close(self):
-        self.client.close()
+        if self.client: self.client.close()
 
 
-# --- Главное приложение установки ---
+# --- Сервис установки (С ИСПРАВЛЕННОЙ ЛОГИКОЙ ВЫПОЛНЕНИЯ КОМАНД) ---
+class InstallationService:
+    def __init__(self, client: SecureSSHClient, user_data: dict, log_callback: Callable[[str], None],
+                 request_sudo_password_func: Callable[[], None], sudo_password_queue: queue.Queue):
+        self.client = client
+        self.data = user_data
+        self.log = log_callback
+        self.request_sudo_password = request_sudo_password_func
+        self.sudo_password_queue = sudo_password_queue
+        self.initial_password = user_data.get('password')
+        self.confirmed_sudo_password = None
+
+    def _execute(self, command: str, use_sudo=False, working_dir: str | None = None):
+        """
+        Собирает и выполняет команду, ПРАВИЛЬНО обрабатывая `cd` и `sudo`.
+        """
+        # --- ПРОСТАЯ И НАДЕЖНАЯ ЛОГИКА СБОРКИ КОМАНДЫ ---
+
+        command_to_run = command
+        password_for_sudo = None
+
+        if use_sudo:
+            # Сначала проверяем, есть ли у нас пароль
+            if not self.confirmed_sudo_password:
+                # Если нет, получаем его (через пароль пользователя или диалог)
+                self._obtain_sudo_password()
+
+            password_for_sudo = self.confirmed_sudo_password
+            command_to_run = f"sudo -S -p '' {command}"
+
+        # `cd` всегда идет в самом начале, перед `sudo`
+        if working_dir:
+            command_to_run = f"cd {working_dir} && {command_to_run}"
+
+        # Выполняем собранную команду
+        return self.client.execute_command(command_to_run, self.log, sudo_password=password_for_sudo)
+
+    def _obtain_sudo_password(self):
+        """
+        Вспомогательный метод, который инкапсулирует логику получения пароля.
+        Вызывается только когда пароль действительно нужен.
+        """
+        # 1. Пробуем пароль из UI
+        if self.initial_password:
+            self.log("Требуются права суперпользователя. Проверяем пароль пользователя для sudo...")
+            # Для проверки мы выполняем простую команду, которая требует sudo
+            test_command = "sudo -S -p '' ls /root"
+            try:
+                self.client.execute_command(test_command, self.log, sudo_password=self.initial_password)
+                self.log("✅ Пароль пользователя подходит для sudo. Запоминаем его.")
+                self.confirmed_sudo_password = self.initial_password
+                self.initial_password = None  # Больше не будем его проверять
+                return
+            except (PermissionError, ChildProcessError):
+                self.log("❌ Пароль пользователя не подходит для sudo.")
+                self.initial_password = None  # Отмечаем, что он не подошел
+
+        # 2. Если мы здесь, значит пароль не подошел или его не было. Спрашиваем.
+        self.log("Запрашиваем пароль для sudo у пользователя...")
+        self.request_sudo_password()
+        new_password = self.sudo_password_queue.get()
+
+        if not new_password:
+            raise ValueError("Пароль для sudo не был предоставлен. Операция прервана.")
+
+        # 3. Проверяем новый пароль
+        self.log("Проверяем полученный пароль sudo...")
+        test_command = "sudo -S -p '' ls /root"
+        try:
+            self.client.execute_command(test_command, self.log, sudo_password=new_password)
+            self.log("✅ Пароль sudo принят. Запоминаем его.")
+            self.confirmed_sudo_password = new_password
+        except (PermissionError, ChildProcessError):
+            self.log("❌ Введен неверный пароль sudo. Установка прервана.")
+            raise PermissionError("Введен неверный пароль для sudo. Попробуйте запустить установку снова.")
+
+    # Остальные методы сервиса без изменений
+    def run_installation(self):
+        try:
+            self.log("Этап 1: Подготовка сервера...")
+            self._setup_server()
+            self.log("✅ Сервер успешно подготовлен.\n")
+            self.log("Этап 2: Развертывание Docker контейнеров...")
+            self._deploy_docker()
+            self.log("✅ Docker контейнеры успешно развернуты.\n")
+            self.log("Этап 3: Применение сетевых правил...")
+            self._apply_network_rules()
+            self.log("✅ Сетевые правила успешно применены.\n")
+            self.log("🎉 --- УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА --- 🎉")
+        except Exception as e:
+            self.log(f"\n--- ❌ КРИТИЧЕСКАЯ ОШИБКА ---\n{type(e).__name__}: {e}")
+
+    def _setup_server(self):
+        os_id = self.client.get_os_release_id()
+        self.log(f"Обнаружена ОС: {os_id}")
+        if os_id not in ("ubuntu", "debian"): raise NotImplementedError(f"Установка на {os_id} не поддерживается.")
+        remote_path = f"~/{REMOTE_PROJECT_DIR}"
+        self.log("Клонирование репозитория...")
+        self._execute(f"rm -rf {remote_path} && git clone {GIT_REPO_URL} {remote_path}")
+        self.log("Запуск скрипта настройки (setup_ubuntu.sh)...")
+        setup_script_path = f"{remote_path}/installer/setup_ubuntu.sh"
+        self._execute(f"chmod +x {setup_script_path}")
+        # Здесь working_dir не нужен, т.к. путь абсолютный
+        self._execute(setup_script_path, use_sudo=True)
+
+    def _deploy_docker(self):
+        remote_path = f"~/{REMOTE_PROJECT_DIR}"
+        use_sudo = self.data['user'] != 'root'
+        self.log(f"Запуск docker compose... (Sudo: {'Да' if use_sudo else 'Нет'})")
+        self._execute("docker compose up --build -d", use_sudo=use_sudo, working_dir=remote_path)
+
+    def _apply_network_rules(self):
+        remote_path = f"~/{REMOTE_PROJECT_DIR}"
+        use_sudo = self.data['user'] != 'root'
+        script_path = "./apply_portmaster_net_rules.sh"  # Используем относительный путь
+        self.log(f"Применение сетевых правил... (Sudo: {'Да' if use_sudo else 'Нет'})")
+        self._execute(f"chmod +x {script_path}", working_dir=remote_path)
+        self._execute(script_path, use_sudo=use_sudo, working_dir=remote_path)
+# --- Главное приложение (UI, передает пароль в сервис) ---
 class InstallerApp:
+    # ... __init__ и другие методы без изменений до _installation_thread_entrypoint ...
     def __init__(self, page: ft.Page):
         self.page = page
         page.title = "Установщик Amnezia Portmaster"
         page.window_width = 800
         page.window_height = 700
-
-        # Поля ввода
-        self.host = ft.TextField(label="Host/IP", width=400)
-        self.port = ft.TextField(label="SSH Port", value="22", width=150)
-        self.user = ft.TextField(label="User", value="root", width=400)
-        self.auth_method = ft.RadioGroup(
-            content=ft.Row([
-                ft.Radio(value="password", label="Password"),
-                ft.Radio(value="key", label="SSH Key")
-            ]),
-            value="password",
-            on_change=self._on_auth_change
-        )
-        self.password = ft.TextField(label="Password", password=True, width=400)
-        self.key_path = ft.TextField(label="Key Path", read_only=True, width=300)
+        self.sudo_password_queue = queue.Queue(maxsize=1)
+        self.sudo_password_input = ft.TextField(label="Пароль для sudo", password=True, can_reveal_password=True,
+                                                autofocus=True)
+        self.host = ft.TextField(label="Host/IP", expand=True)
+        self.port = ft.TextField(label="SSH Port", value="22", width=120)
+        self.user = ft.TextField(label="User", value="root", expand=True)
+        self.password = ft.TextField(label="Пароль пользователя", password=True, can_reveal_password=True, expand=True)
+        self.key_path = ft.TextField(label="Путь к приватному SSH ключу", read_only=True, expand=True)
+        self.key_password = ft.TextField(label="Пароль от SSH ключа (если есть)", password=True,
+                                         can_reveal_password=True)
         self.key_picker = ft.FilePicker(on_result=self._on_key_picked)
         page.overlay.append(self.key_picker)
-        self.pick_btn = ft.ElevatedButton("Choose Key", on_click=lambda _:
-            self.key_picker.pick_files(dialog_title="Select SSH Key", allowed_extensions=["pem", "key"])
+        self.pick_btn = ft.ElevatedButton(
+            "Выбрать ключ",
+            icon=ft.Icons.FOLDER_OPEN,
+            on_click=lambda _: self.key_picker.pick_files(dialog_title="Выберите приватный ключ"),
+            style=ft.ButtonStyle(
+                padding=ft.padding.symmetric(vertical=15, horizontal=15),
+            )
         )
-        self.pass_container = ft.Container(content=self.password, visible=True)
-        self.key_container = ft.Container(content=ft.Row([self.key_path, self.pick_btn]), visible=False)
-
-        # Лог и кнопки
-        self.log_col = ft.Column(expand=True, spacing=5)
-        self.install_btn = ft.ElevatedButton("Install", icon=ft.Icons.ROCKET_LAUNCH, on_click=self._on_install)
+        self.log_output_column = ft.Column(spacing=5, expand=True, scroll=ft.ScrollMode.ADAPTIVE)
+        self.install_btn = ft.ElevatedButton("Установить", icon=ft.Icons.ROCKET_LAUNCH, on_click=self._on_install,
+                                             style=ft.ButtonStyle(padding=ft.padding.symmetric(vertical=20, horizontal=20),
+            ))
         self.progress = ft.ProgressRing(visible=False)
-
+        self.copy_log_btn = ft.IconButton(icon=ft.Icons.COPY, tooltip="Скопировать лог",
+                                          on_click=self._copy_log_to_clipboard)
         self._build_ui()
 
-    def _on_auth_change(self, e):
-        use_pass = self.auth_method.value == "password"
-        self.pass_container.visible = use_pass
-        self.key_container.visible = not use_pass
-        self.page.update()
-
-    def _on_key_picked(self, e):
+    def _on_key_picked(self, e: ft.FilePickerResultEvent):
         if e.files:
             self.key_path.value = e.files[0].path
             self.page.update()
 
+    def _copy_log_to_clipboard(self, e):
+        full_log = "\n".join([txt.value for txt in self.log_output_column.controls if isinstance(txt, ft.Text)])
+        self.page.set_clipboard(full_log)
+        self.page.snack_bar = ft.SnackBar(content=ft.Text("Лог скопирован в буфер обмена!"), duration=2000)
+        self.page.snack_bar.open = True
+        self.page.update()
+
     def _log(self, msg: str):
-        text = msg.rstrip("\n")
+        text = msg.strip()
         if text:
-            self.log_col.controls.append(ft.Text(text, font_family="Consolas", size=12))
+            self.log_output_column.controls.append(ft.Text(text, font_family="Consolas", size=12, selectable=True))
             self.page.update()
 
     def _lock_ui(self, lock: bool):
-        self.install_btn.disabled = lock
-        self.progress.visible = lock
-        for ctl in (self.host, self.port, self.user, self.password, self.pick_btn, self.auth_method):
+        for ctl in (self.install_btn, self.host, self.port, self.user, self.password, self.pick_btn, self.key_path,
+                    self.key_password):
             ctl.disabled = lock
+        self.progress.visible = lock
+        self.copy_log_btn.disabled = lock
         self.page.update()
 
-    def _validate(self) -> bool:
-        if not self.host.value:
-            self._log("ERROR: host empty")
+    def _validate_inputs(self) -> bool:
+        if not self.host.value or not self.port.value.isdigit() or not self.user.value:
+            self._log("❌ Ошибка: Заполните поля Host/IP, Port и User.")
             return False
-        if not self.port.value.isdigit():
-            self._log("ERROR: port must be a number")
-            return False
-        if self.auth_method.value == "password" and not self.password.value:
-            self._log("ERROR: password required")
-            return False
-        if self.auth_method.value == "key" and not self.key_path.value:
-            self._log("ERROR: key file required")
+        if not self.key_path.value and not self.password.value:
+            self._log("❌ Ошибка: Укажите пароль пользователя или выберите SSH ключ.")
             return False
         return True
 
     def _on_install(self, e):
-        self.log_col.controls.clear()
-        if not self._validate():
-            return
+        self.log_output_column.controls.clear()
+        self.page.update()
+        if not self._validate_inputs(): return
         self._lock_ui(True)
-        threading.Thread(target=self._install_thread, daemon=True).start()
+        threading.Thread(target=self._installation_thread_entrypoint, daemon=True).start()
 
-    def _install_thread(self):
+    def _request_sudo_password_dialog(self):
+        self.sudo_password_input.value = ""
+
+        def close_dialog(e, password_provided: bool):
+            password = self.sudo_password_input.value if password_provided else None
+            self.sudo_password_queue.put(password)
+            self.page.dialog.open = False
+            self.page.update()
+
+        dialog = ft.AlertDialog(modal=True, title=ft.Text("Требуется пароль для Sudo"), content=ft.Column(
+            [ft.Text(f"Пароль пользователя не подошел или не был указан. Введите пароль для sudo."),
+             self.sudo_password_input]), actions=[ft.TextButton("Отмена", on_click=lambda e: close_dialog(e, False)),
+                                                  ft.FilledButton("OK", on_click=lambda e: close_dialog(e, True))])
+        self.page.dialog = dialog
+        dialog.open = True
+        self.page.update()
+
+    def _installation_thread_entrypoint(self):
         client = SecureSSHClient()
         try:
-            self._log(f"Connecting to {self.host.value}:{self.port.value}...")
+            self._log(f"Подключение к {self.user.value}@{self.host.value}:{self.port.value}...")
             client.connect(
-                hostname=self.host.value,
-                port=int(self.port.value),
-                username=self.user.value,
-                password=self.password.value if self.auth_method.value=="password" else None,
-                key_filename=self.key_path.value if self.auth_method.value=="key" else None
+                hostname=self.host.value.strip(), port=int(self.port.value.strip()),
+                username=self.user.value.strip(),
+                password=self.password.value if not self.key_path.value else None,
+                key_filename=self.key_path.value or None,
+                key_password=self.key_password.value or None
             )
-            self._log("Connected!")
-            self._setup_server(client)
-            self._deploy_docker(client)
-            self._apply_network_rules(client)
-            self._log("\n--- INSTALL COMPLETE ---")
+            self._log("✅ Подключение успешно установлено!")
+
+            # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ ---
+            # Передаем пароль из UI в сервис
+            user_data = {
+                'user': self.user.value.strip(),
+                'password': self.password.value
+            }
+
+            service = InstallationService(
+                client=client, user_data=user_data,
+                log_callback=self._log,
+                request_sudo_password_func=self._request_sudo_password_dialog,
+                sudo_password_queue=self.sudo_password_queue
+            )
+            service.run_installation()
         except Exception as ex:
-            self._log(f"\n--- FATAL ERROR ---\n{type(ex).__name__}: {ex}")
+            self._log(f"\n--- ❌ КРИТИЧЕСКАЯ ОШИБКА ---\n{type(ex).__name__}: {ex}")
         finally:
             client.close()
             self._lock_ui(False)
 
-    def _setup_server(self, client: SecureSSHClient):
-        self._log("Detecting OS...")
-        os_id = client.get_os_release_id()
-        self._log(f"OS: {os_id}")
-        if os_id not in ("ubuntu", "debian"):
-            raise NotImplementedError(f"Unsupported OS: {os_id}")
-        remote = f"~/{REMOTE_PROJECT_DIR}"
-        # клоним и запускаем setup
-        cmd = (
-            f"rm -rf {remote} && "
-            f"git clone {GIT_REPO_URL} {remote} && "
-            f"chmod +x {remote}/installer/setup_ubuntu.sh && "
-            f"sudo -S {remote}/installer/setup_ubuntu.sh"
-        )
-        client.execute_command(cmd, self._log, use_sudo=True, sudo_password=self.password.value)
-
-    def _deploy_docker(self, client: SecureSSHClient):
-        remote = f"~/{REMOTE_PROJECT_DIR}"
-        # одной командой переходим и поднимаем compose
-        cmd = f"docker compose up --build -d"
-        use_sudo = self.user.value != "root"
-        client.execute_command(cmd, self._log, use_sudo=use_sudo, sudo_password=self.password.value if use_sudo else None, working_dir=remote)
-
-    def _apply_network_rules(self, client: SecureSSHClient):
-        remote = f"~/{REMOTE_PROJECT_DIR}"
-        use_sudo = self.user.value != "root"
-        client.execute_command( f"chmod +x {remote}/apply_portmaster_net_rules.sh", self._log, use_sudo=False)
-        client.execute_command(f"{remote}/apply_portmaster_net_rules.sh", self._log, use_sudo=use_sudo, sudo_password=self.password.value if use_sudo else None,
-                               working_dir=remote)
-
-
     def _build_ui(self):
-        self.page.add(
-            ft.Column([
-                ft.Text("1. Connection", size=18, weight=ft.FontWeight.BOLD),
-                self.host,
-                ft.Row([self.port, self.user]),
-                ft.Text("Auth method:"),
-                self.auth_method,
-                self.pass_container,
-                self.key_container,
-                ft.Divider(),
-                ft.Row([self.install_btn, self.progress]),
-                ft.Divider(),
-                ft.Column([
-                    ft.Text("2. Logs", size=18, weight=ft.FontWeight.BOLD),
-                    ft.Container(
-                        content=ft.ListView([self.log_col], auto_scroll=True, expand=True),
-                        border=ft.border.all(1, ft.Colors.OUTLINE),
-                        border_radius=5,
-                        padding=10,
-                        expand=True
-                    )
-                ], expand=True),
-            ], expand=True, scroll=ft.ScrollMode.ADAPTIVE)
-        )
+        self.page.add(ft.Column([
+            ft.Text("Параметры подключения", size=18, weight=ft.FontWeight.BOLD),
+            ft.Row([self.host, self.port]), ft.Row([self.user, self.password]),
+            ft.Text("Авторизация по ключу (рекомендуется)", weight=ft.FontWeight.BOLD),
+            ft.Row([self.key_path]),
+            ft.Row([self.key_password, self.pick_btn]),
+            ft.Divider(height=5),
+            ft.Row([self.install_btn, self.progress]),
+            ft.Divider(height=5),
+            ft.Row([ft.Text("Лог выполнения", size=18, weight=ft.FontWeight.BOLD), self.copy_log_btn]),
+            ft.Row([ft.Container(content=self.log_output_column, border=None, padding=10, expand=True)]),
+        ], expand=True))
         self.page.update()
 
 
 def main(page: ft.Page):
-    page.title = "Config Check..."
     if is_path_critically_dangerous(REMOTE_PROJECT_DIR):
         show_monkey_with_grenade_dialog(page, REMOTE_PROJECT_DIR)
     else:

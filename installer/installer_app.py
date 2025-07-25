@@ -1,9 +1,10 @@
 import pathlib
 import pwd
+import queue
 import re
 import threading
-from typing import Callable
-
+from typing import Callable, Container
+import socket
 import flet as ft
 import paramiko
 import os
@@ -11,7 +12,8 @@ import os
 # --- КОНФИГУРАЦИЯ ---
 GIT_REPO_URL = "https://github.com/protototo/amnezia-portmaster.git"
 REMOTE_PROJECT_DIR = "amnezia-portmaster"
-
+UFW_RULE_COMMENT = "Added-by-Amnezia-Portmaster-Installer"
+CONTAINER_NAME = "portmaster"
 
 # --- Утилиты и диалоги (без изменений) ---
 def is_path_critically_dangerous(path_str: str) -> bool:
@@ -36,7 +38,6 @@ def show_monkey_with_grenade_dialog(page: ft.Page, dangerous_path: str):
                                 size=14, text_align=ft.TextAlign.CENTER), actions=[
             ft.ElevatedButton("Понял", on_click=close_dialog, color=ft.Colors.WHITE, bgcolor=ft.Colors.RED_700)],
                             actions_alignment=ft.MainAxisAlignment.END)
-    #page.dialog = dialog
     page.update()
     page.open(dialog)
 
@@ -130,13 +131,62 @@ class SecureSSHClient:
 
 # --- Сервис установки (С ИСПРАВЛЕННОЙ ЛОГИКОЙ ВЫПОЛНЕНИЯ КОМАНД) ---
 class InstallationService:
-    def __init__(self, client: SecureSSHClient, user_data: dict, log_callback: Callable[[str], None]
+    def __init__(self, client: SecureSSHClient, user_data: dict, log_callback: Callable[[str], None],
+                 request_confirmation_func: Callable[[], None], confirmation_queue: queue.Queue
                  ):
         self.client = client
         self.data = user_data
         self.log = log_callback
+        self.request_confirmation = request_confirmation_func
+        self.confirmation_queue = confirmation_queue
         self.initial_password = user_data.get('password')
         self.confirmed_sudo_password = None
+        self.pm_port = user_data.get('pm_port')
+        self.pm_range = user_data.get('pm_range')
+        self.amn0_ip = None # Будет определен во время установки
+
+    def _check_for_existing_installation(self) -> bool:
+        """Проверяет, существует ли уже контейнер Portmaster."""
+        self.log("Проверка на наличие предыдущих установок...")
+        # `docker ps -a` показывает все контейнеры, даже остановленные
+        # `grep -q` работает в "тихом" режиме, возвращая только код завершения
+        command = f"docker ps -a --format '{{{{.Names}}}}' | grep -q '^{CONTAINER_NAME}$'"
+        try:
+            # sudo здесь не всегда нужно, но лучше перестраховаться, если docker настроен для рута
+            use_sudo = self.data['user'] != 'root'
+            self._execute(command, use_sudo=use_sudo)
+            # Если команда завершилась с кодом 0, значит grep нашел контейнер
+            self.log(f"⚠️ Обнаружен существующий контейнер '{CONTAINER_NAME}'.")
+            return True
+        except ChildProcessError:
+            self.log("✅ Предыдущих установок не найдено.")
+            return False
+
+    def _cleanup_previous_installation(self):
+        """Останавливает и удаляет старый контейнер и его правила UFW."""
+        self.log("Начало очистки предыдущей установки...")
+        use_sudo = self.data['user'] != 'root'
+
+        # 1. Удаляем контейнер
+        self.log(f"Остановка и удаление контейнера '{CONTAINER_NAME}'...")
+        # `docker stop ... || true` - чтобы команда не падала, если контейнер уже остановлен
+        cleanup_command = f"docker stop {CONTAINER_NAME} || true && docker rm {CONTAINER_NAME}"
+        self._execute(cleanup_command, use_sudo=use_sudo)
+
+        # 2. Удаляем правило UFW
+        self.log("Поиск и удаление старых правил UFW...")
+        # Эта команда находит номер правила по нашему комментарию и передает его в `ufw delete`
+        # `yes | ...` автоматически отвечает "y" на запрос подтверждения от `ufw delete`
+        ufw_cleanup_command = (
+                "UFW_RULE_NUM=$(sudo ufw status numbered | grep -E \"'" + UFW_RULE_COMMENT + "'\" | awk -F'[][]' '{print $2}') && "
+                                                                                             "[ -n \"$UFW_RULE_NUM\" ] && sudo ufw --force delete $UFW_RULE_NUM"
+        )
+        try:
+            self._execute(ufw_cleanup_command, use_sudo=True)
+            self.log("✅ Старые артефакты успешно удалены.")
+        except ChildProcessError as e:
+            # Не страшно, если команда упала - возможно, правила и не было
+            self.log("Не удалось найти или удалить правило UFW (возможно, его и не было).")
 
     def _execute(self, command: str, use_sudo=False, working_dir: str | None = None):
         """
@@ -163,6 +213,50 @@ class InstallationService:
         # Выполняем собранную команду
         return self.client.execute_command(command_to_run, self.log, sudo_password=password_for_sudo)
 
+    def _ensure_port_is_open(self):
+        """Проверяет доступность порта с клиента и открывает его в UFW при необходимости."""
+        self.log(f"\nЭтап 5: Проверка доступности порта {self.pm_port}...")
+
+        # Шаг 1: Первая попытка подключения с клиента
+        self.log(f"Попытка подключения к {self.amn0_ip}:{self.pm_port}...")
+        try:
+            with socket.create_connection((self.amn0_ip, self.pm_port), timeout=5):
+                self.log(f"✅ Порт {self.pm_port} уже открыт и доступен!")
+                return  # Все хорошо, выходим
+        except (socket.timeout, ConnectionRefusedError, OSError) as e:
+            self.log(f"⚠️ Порт недоступен: {e}. Приступаем к диагностике файрвола...")
+
+        # Шаг 2: Диагностика UFW на сервере
+        try:
+            ufw_status_output = self._execute("sudo ufw status", use_sudo=True)
+            if "Status: inactive" in ufw_status_output:
+                # Если UFW неактивен, а порт недоступен - проблема в другом
+                raise RuntimeError(
+                    f"Порт {self.pm_port} недоступен, но UFW неактивен. "
+                    "Возможные проблемы: ошибка в Docker-контейнере, другая сетевая проблема."
+                )
+        except ChildProcessError:
+            # Если команда ufw не найдена, считаем, что файрвола нет
+            raise RuntimeError(f"Порт {self.pm_port} недоступен и команда `ufw` не найдена на сервере.")
+
+        # Шаг 3: Исправление - открываем порт
+        self.log("UFW активен. Добавляем правило, чтобы разрешить трафик...")
+        self._execute(f"sudo ufw allow {self.pm_port}/tcp comment '{UFW_RULE_COMMENT}'", use_sudo=True)
+        self.log(f"✅ Правило для порта {self.pm_port} добавлено в UFW.")
+
+        # Шаг 4: Верификация - вторая попытка подключения
+        self.log(f"Повторная проверка доступности порта {self.amn0_ip}:{self.pm_port}...")
+        try:
+            with socket.create_connection((self.amn0_ip, self.pm_port), timeout=5):
+                self.log(f"✅ Отлично! Порт {self.pm_port} теперь открыт и доступен.")
+        except (socket.timeout, ConnectionRefusedError, OSError) as e:
+            # Если и после открытия порта он недоступен - что-то не так
+            raise RuntimeError(
+                f"Порт {self.pm_port} был открыт в UFW, но по-прежнему недоступен: {e}. "
+                "Проверьте настройки сети и Docker на сервере."
+            )
+
+
     def _obtain_sudo_password(self):
         """
         Вспомогательный метод, который инкапсулирует логику получения пароля.
@@ -182,20 +276,83 @@ class InstallationService:
             except (PermissionError, ChildProcessError):
                 self.log("❌ Пароль пользователя не подходит для sudo.")
                 self.initial_password = None  # Отмечаем, что он не подошел
+                raise PermissionError("Пароль пользователя не подходит для sudo. Установка прервана.")
 
-    # Остальные методы сервиса без изменений
+    def _get_amn0_ip(self) -> str:
+        """Определяет и возвращает IP-адрес интерфейса amn0."""
+        self.log("Определение IP-адреса интерфейса amn0...")
+        # Команда для извлечения IPv4 адреса из вывода `ip addr`
+        command = "ip -4 addr show amn0 | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'"
+        try:
+            ip_address = self._execute(command).strip()
+            if not ip_address:
+                raise RuntimeError("Интерфейс amn0 найден, но IP-адрес не назначен.")
+            self.log(f"✅ IP-адрес amn0: {ip_address}")
+            self.amn0_ip = ip_address
+            return ip_address
+        except ChildProcessError:
+             raise RuntimeError("Не удалось найти интерфейс amn0. Убедитесь, что AmneziaVPN установлена и запущена.")
+
+    def _configure_docker_compose(self):
+        """Заменяет плейсхолдеры в docker-compose.yml на значения из UI."""
+        ip = self._get_amn0_ip()
+
+        compose_path = f"~/{REMOTE_PROJECT_DIR}/docker-compose.yaml"
+        self.log(f"Настройка файла {compose_path}...")
+
+        # Мы используем sed с опцией -e для выполнения нескольких замен за один вызов.
+        # Это эффективнее, чем вызывать sed три раза.
+        sed_command = (
+            f"sed -i "
+            f"-e 's/^      - PORTMASTER_IP=.*/      - PORTMASTER_IP={ip}/' "
+            f"-e 's/^      - PORTMASTER_PORT=.*/      - PORTMASTER_PORT={self.pm_port}/' "
+            f"-e 's/^      - EXPOSED_PORT_RANGE=.*/      - EXPOSED_PORT_RANGE={self.pm_range}/' "
+            f"{compose_path}"
+        )
+
+        # Модификация файла, который мы только что склонировали, не требует sudo
+        self._execute(sed_command)
+        self.log("✅ docker-compose.yml успешно настроен.")
+
+
     def run_installation(self):
         try:
+
+            if self._check_for_existing_installation():
+                self.request_confirmation()
+                if not self.confirmation_queue.get():
+                    self.log("Установка отменена пользователем.")
+                    return
+                self._cleanup_previous_installation()
+
+
             self.log("Этап 1: Подготовка сервера...")
             self._setup_server()
             self.log("✅ Сервер успешно подготовлен.\n")
-            self.log("Этап 2: Развертывание Docker контейнеров...")
+
+            # --- ИЗМЕНЕНИЕ: Добавляем шаг конфигурации перед деплоем ---
+            self.log("Этап 2: Конфигурация Portmaster...")
+            self._configure_docker_compose()
+            self.log("✅ Конфигурация успешно завершена.\n")
+
+            self.log("Этап 3: Развертывание Docker контейнеров...")
             self._deploy_docker()
             self.log("✅ Docker контейнеры успешно развернуты.\n")
-            self.log("Этап 3: Применение сетевых правил...")
+
+            self.log("Этап 4: Применение сетевых правил...")
             self._apply_network_rules()
             self.log("✅ Сетевые правила успешно применены.\n")
+
+            self._ensure_port_is_open()
+            self.log("✅ Сетевая доступность к сервису подтверждена.\n")
+
+            # --- ИЗМЕНЕНИЕ: Добавляем финальное саммари ---
             self.log("🎉 --- УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА --- 🎉")
+            self.log("\n--- Итоги установки ---")
+            self.log(f"Portmaster доступен по адресу: {self.amn0_ip}:{self.pm_port}")
+            self.log(f"Диапазон портов для проброса: {self.pm_range}")
+            self.log("-------------------------\n")
+
         except Exception as e:
             self.log(f"\n--- ❌ КРИТИЧЕСКАЯ ОШИБКА ---\n{type(e).__name__}: {e}")
 
@@ -233,6 +390,7 @@ class InstallerApp:
     def __init__(self, page: ft.Page):
         self.page = page
         page.title = "Установщик Amnezia Portmaster"
+        self.confirmation_queue = queue.Queue(maxsize=1)
 
         default_user = get_current_username()
         default_key_path = find_default_ssh_key()
@@ -280,6 +438,29 @@ class InstallerApp:
 
         self._build_ui()
 
+    def _request_cleanup_confirmation(self):
+        """Показывает диалог и ждет подтверждения от пользователя."""
+        def close_dialog(e, confirmed: bool):
+            self.confirmation_queue.put(confirmed)
+            dialog.open = False
+            self.page.update()
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("⚠️ Обнаружена предыдущая установка"),
+            content=ft.Text(
+                f"На сервере уже запущен контейнер с именем '{CONTAINER_NAME}'.\n\n"
+                "Продолжить? Это приведет к остановке и удалению существующего контейнера и связанных с ним правил файрвола."
+            ),
+            actions=[
+                ft.TextButton("Отмена", on_click=lambda e: close_dialog(e, False)),
+                ft.ElevatedButton("Да, удалить и продолжить", on_click=lambda e: close_dialog(e, True), color=ft.Colors.WHITE, bgcolor=ft.Colors.RED),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.update()
+        self.page.open(dialog)
+
     def _on_key_picked(self, e: ft.FilePickerResultEvent):
         if e.files:
             self.key_path.value = e.files[0].path
@@ -313,6 +494,15 @@ class InstallerApp:
         if not self.key_path.value and not self.password.value:
             self._log("❌ Ошибка: Укажите пароль пользователя или выберите SSH ключ.")
             return False
+        if not all(p.value.isdigit() for p in [self.pm_service_port, self.pm_pool_start, self.pm_pool_end]):
+            self._log("❌ Ошибка: Порты и диапазон пула Portmaster должны быть числами.")
+            return False
+        if  int(self.pm_service_port.value) < 1081:
+            self._log("❌ Ошибка: Порт Portmaster должен быть больше 1080.")
+            return False
+        if  int(self.pm_pool_start.value) >= int(self.pm_pool_end.value):
+            self._log("❌ Ошибка: Введите корректный диапазон портов")
+            return False
         return True
 
     def _on_install(self, e):
@@ -336,16 +526,18 @@ class InstallerApp:
             )
             self._log("✅ Подключение успешно установлено!")
 
-            # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ ---
-            # Передаем пароль из UI в сервис
             user_data = {
                 'user': self.user.value.strip(),
-                'password': self.password.value
+                'password': self.password.value,
+                'pm_port': self.pm_service_port.value,
+                'pm_range': f"{self.pm_pool_start.value}-{self.pm_pool_end.value}"
             }
 
             service = InstallationService(
                 client=client, user_data=user_data,
-                log_callback=self._log
+                log_callback=self._log,
+                request_confirmation_func=self._request_cleanup_confirmation,
+                confirmation_queue=self.confirmation_queue
             )
             service.run_installation()
         except Exception as ex:

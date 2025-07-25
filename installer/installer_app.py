@@ -1,6 +1,5 @@
 import re
 import threading
-import queue  # Импортируем очередь
 from typing import Callable
 
 import flet as ft
@@ -96,13 +95,11 @@ class SecureSSHClient:
 
 # --- Сервис установки (С ИСПРАВЛЕННОЙ ЛОГИКОЙ ВЫПОЛНЕНИЯ КОМАНД) ---
 class InstallationService:
-    def __init__(self, client: SecureSSHClient, user_data: dict, log_callback: Callable[[str], None],
-                 request_sudo_password_func: Callable[[], None], sudo_password_queue: queue.Queue):
+    def __init__(self, client: SecureSSHClient, user_data: dict, log_callback: Callable[[str], None]
+                 ):
         self.client = client
         self.data = user_data
         self.log = log_callback
-        self.request_sudo_password = request_sudo_password_func
-        self.sudo_password_queue = sudo_password_queue
         self.initial_password = user_data.get('password')
         self.confirmed_sudo_password = None
 
@@ -151,25 +148,6 @@ class InstallationService:
                 self.log("❌ Пароль пользователя не подходит для sudo.")
                 self.initial_password = None  # Отмечаем, что он не подошел
 
-        # 2. Если мы здесь, значит пароль не подошел или его не было. Спрашиваем.
-        self.log("Запрашиваем пароль для sudo у пользователя...")
-        self.request_sudo_password()
-        new_password = self.sudo_password_queue.get()
-
-        if not new_password:
-            raise ValueError("Пароль для sudo не был предоставлен. Операция прервана.")
-
-        # 3. Проверяем новый пароль
-        self.log("Проверяем полученный пароль sudo...")
-        test_command = "sudo -S -p '' ls /root"
-        try:
-            self.client.execute_command(test_command, self.log, sudo_password=new_password)
-            self.log("✅ Пароль sudo принят. Запоминаем его.")
-            self.confirmed_sudo_password = new_password
-        except (PermissionError, ChildProcessError):
-            self.log("❌ Введен неверный пароль sudo. Установка прервана.")
-            raise PermissionError("Введен неверный пароль для sudo. Попробуйте запустить установку снова.")
-
     # Остальные методы сервиса без изменений
     def run_installation(self):
         try:
@@ -212,17 +190,15 @@ class InstallationService:
         self.log(f"Применение сетевых правил... (Sudo: {'Да' if use_sudo else 'Нет'})")
         self._execute(f"chmod +x {script_path}", working_dir=remote_path)
         self._execute(script_path, use_sudo=use_sudo, working_dir=remote_path)
-# --- Главное приложение (UI, передает пароль в сервис) ---
+
+
+# --- Главное приложение (UI) ---
 class InstallerApp:
     # ... __init__ и другие методы без изменений до _installation_thread_entrypoint ...
     def __init__(self, page: ft.Page):
         self.page = page
         page.title = "Установщик Amnezia Portmaster"
-        page.window_width = 800
-        page.window_height = 700
-        self.sudo_password_queue = queue.Queue(maxsize=1)
-        self.sudo_password_input = ft.TextField(label="Пароль для sudo", password=True, can_reveal_password=True,
-                                                autofocus=True)
+
         self.host = ft.TextField(label="Host/IP", expand=True)
         self.port = ft.TextField(label="SSH Port", value="22", width=120)
         self.user = ft.TextField(label="User", value="root", expand=True)
@@ -247,6 +223,15 @@ class InstallerApp:
         self.progress = ft.ProgressRing(visible=False)
         self.copy_log_btn = ft.IconButton(icon=ft.Icons.COPY, tooltip="Скопировать лог",
                                           on_click=self._copy_log_to_clipboard)
+        self.pm_service_port = ft.TextField(
+            label="Порт сервиса Portmaster",
+            value="5000",
+            width=180
+        )
+        self.pm_pool_start = ft.TextField(label="Начало пула", value="20000", expand=True)
+        self.pm_pool_end = ft.TextField(label="Конец пула", value="21000", expand=True)
+        self.log_output_column = ft.Column(spacing=5, expand=True, scroll=ft.ScrollMode.ADAPTIVE)
+
         self._build_ui()
 
     def _on_key_picked(self, e: ft.FilePickerResultEvent):
@@ -291,22 +276,6 @@ class InstallerApp:
         self._lock_ui(True)
         threading.Thread(target=self._installation_thread_entrypoint, daemon=True).start()
 
-    def _request_sudo_password_dialog(self):
-        self.sudo_password_input.value = ""
-
-        def close_dialog(e, password_provided: bool):
-            password = self.sudo_password_input.value if password_provided else None
-            self.sudo_password_queue.put(password)
-            self.page.dialog.open = False
-            self.page.update()
-
-        dialog = ft.AlertDialog(modal=True, title=ft.Text("Требуется пароль для Sudo"), content=ft.Column(
-            [ft.Text(f"Пароль пользователя не подошел или не был указан. Введите пароль для sudo."),
-             self.sudo_password_input]), actions=[ft.TextButton("Отмена", on_click=lambda e: close_dialog(e, False)),
-                                                  ft.FilledButton("OK", on_click=lambda e: close_dialog(e, True))])
-        self.page.dialog = dialog
-        dialog.open = True
-        self.page.update()
 
     def _installation_thread_entrypoint(self):
         client = SecureSSHClient()
@@ -330,9 +299,7 @@ class InstallerApp:
 
             service = InstallationService(
                 client=client, user_data=user_data,
-                log_callback=self._log,
-                request_sudo_password_func=self._request_sudo_password_dialog,
-                sudo_password_queue=self.sudo_password_queue
+                log_callback=self._log
             )
             service.run_installation()
         except Exception as ex:
@@ -342,22 +309,152 @@ class InstallerApp:
             self._lock_ui(False)
 
     def _build_ui(self):
-        self.page.add(ft.Column([
-            ft.Text("Параметры подключения", size=18, weight=ft.FontWeight.BOLD),
-            ft.Row([self.host, self.port]), ft.Row([self.user, self.password]),
-            ft.Text("Авторизация по ключу (рекомендуется)", weight=ft.FontWeight.BOLD),
-            ft.Row([self.key_path]),
-            ft.Row([self.key_password, self.pick_btn]),
-            ft.Divider(height=5),
-            ft.Row([self.install_btn, self.progress]),
-            ft.Divider(height=5),
-            ft.Row([ft.Text("Лог выполнения", size=18, weight=ft.FontWeight.BOLD), self.copy_log_btn]),
-            ft.Row([ft.Container(content=self.log_output_column, border=None, padding=10, expand=True)]),
-        ], expand=True))
+        self.page.clean()
+        self.page.add(
+            ft.Row(
+                controls=[
+                    # --- КОЛОНКА 1: Подсказки и кнопка установки (слева) ---
+                    ft.Column(
+                        width=250,
+                        controls=[
+                            # Контейнер для подсказок, чтобы они занимали доступное пространство
+                            ft.Container(
+                                content=ft.Column(
+                                    controls=[
+                                        ft.Row([ft.Icon(ft.Icons.INFO_OUTLINE, color=ft.Colors.BLUE_400, size=20),
+                                                ft.Text("Подключение", weight=ft.FontWeight.BOLD)]),
+                                        ft.Text("Введите данные для подключения к вашему серверу по SSH.", size=13,
+                                                color=ft.Colors.ON_SURFACE_VARIANT),
+                                        ft.Divider(height=40),
+
+                                        ft.Row([ft.Icon(ft.Icons.KEY, color=ft.Colors.AMBER_400, size=20),
+                                                ft.Text("Авторизация", weight=ft.FontWeight.BOLD)]),
+                                        ft.Text(
+                                            "Рекомендуется использовать SSH-ключ. Если ключ не выбран, будет использован пароль.",
+                                            size=13, color=ft.Colors.ON_SURFACE_VARIANT),
+                                        ft.Divider(height=40),
+                                        ft.Text(
+                                            "Убедитесь что у пользователя есть права root",
+                                            size=13, color=ft.Colors.ON_SURFACE_VARIANT),
+                                        ft.Divider(height=40),
+
+                                        ft.Text(
+                                            "Для работы через sudo нужно ввести пароль даже при авторизации по ключу",
+                                            size=13, color=ft.Colors.ON_SURFACE_VARIANT),
+                                        ft.Divider(height=40),
+
+                                        ft.Row([ft.Icon(ft.Icons.SETTINGS_APPLICATIONS, color=ft.Colors.GREEN_400,
+                                                        size=20), ft.Text("Portmaster", weight=ft.FontWeight.BOLD)]),
+                                        ft.Text("Настройте порты для работы сервиса и проброса портов.", size=13,
+                                                color=ft.Colors.ON_SURFACE_VARIANT),
+                                        ft.Text(
+                                            "Порты пробрасываются позже клиентом из указанного диапазона."
+                                            ,
+                                            size=13,
+                                            color=ft.Colors.ON_SURFACE_VARIANT),
+                                        ft.Text(
+                                            "Клиенты подключающиеся к разным VPN протоколам используют один и тот же пул портов. 1000 портов обычно хвататет. ",
+                                            size=13,
+                                            color=ft.Colors.ON_SURFACE_VARIANT),
+                                        ft.Text(
+                                            "Portmaster будет жить в отдельном контейнере. Установка не разорвет существующие VPN подключения.",
+                                            size=13,
+                                            color=ft.Colors.ON_SURFACE_VARIANT),
+                                    ],
+                                    spacing=10
+                                ),
+                                expand=True,
+                                padding=ft.padding.only(top=10, right=10)
+                            )
+                        ]
+                    ),
+
+                    # --- КОЛОНКА 2: Настройки (центр) ---
+                    ft.Column(
+                        width=550,
+                        spacing=10,
+                        scroll=ft.ScrollMode.ADAPTIVE,
+                        controls=[
+                            ft.Card(
+                                ft.Container(
+                                    content=ft.Column( spacing=15,controls=[
+                                        ft.Text("Параметры подключения", weight=ft.FontWeight.BOLD, size=16),
+                                        ft.Row([self.host, self.port]),
+                                        self.user,
+                                        self.password,
+                                    ]),
+                                    padding=20
+                                )
+                            ),
+                            ft.Card(
+                                ft.Container(
+                                    content=ft.Column(spacing=15,controls=[
+                                        ft.Text("Авторизация по ключу", weight=ft.FontWeight.BOLD, size=16),
+                                        self.key_path,
+                                        ft.Row([self.key_password, self.pick_btn]),
+                                    ]),
+                                    padding=20
+                                )
+                            ),
+                            ft.Card(
+                                ft.Container(
+                                    content=ft.Column(spacing=15,controls=[
+                                        ft.Text("Настройки Portmaster", weight=ft.FontWeight.BOLD, size=16),
+                                        self.pm_service_port,
+                                        ft.Text("Диапазон портов для проброса:"),
+                                        ft.Row(
+                                            controls=[
+                                                self.pm_pool_start,
+                                                ft.Text("-", size=20),
+                                                self.pm_pool_end
+                                            ],
+                                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN
+                                        )
+                                    ]),
+                                    padding=20
+                                )
+                            ),
+                            # Контейнер для кнопки установки в самом низу
+                            ft.Container(
+                                content=ft.Row([self.install_btn, self.progress]),
+                                padding=ft.padding.all(10),
+                                alignment=ft.alignment.bottom_right
+                            )
+                        ]
+                    ),
+
+                    ft.VerticalDivider(width=10),
+
+                    # --- КОЛОНКА 3: Лог (справа) ---
+                    ft.Column(
+                        expand=True,  # Эта колонка займет все оставшееся место
+                        controls=[
+                            ft.Row([
+                                ft.Text("Лог выполнения", size=18, weight=ft.FontWeight.BOLD),
+                                self.copy_log_btn
+                            ]),
+                            ft.Container(
+                                content=self.log_output_column,
+                                border=None,
+                                padding=10,
+                                width=300,
+                                expand=True,  # Контейнер лога растягивается на всю высоту колонки
+                            )
+                        ]
+                    )
+                ],
+                expand=True,  # Главный Row растягивается на всю высоту и ширину окна
+                vertical_alignment=ft.CrossAxisAlignment.START
+            )
+        )
         self.page.update()
 
 
 def main(page: ft.Page):
+    page.window.width = 1200
+    page.window.height = 850
+    page.window.min_width = 1200
+    page.window.min_height = 850
     if is_path_critically_dangerous(REMOTE_PROJECT_DIR):
         show_monkey_with_grenade_dialog(page, REMOTE_PROJECT_DIR)
     else:

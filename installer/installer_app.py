@@ -120,7 +120,7 @@ class L10nManager:
 
         try:
             # Пытаемся получить системную локаль
-            system_locale_code, _ = locale.getdefaultlocale()
+            system_locale_code, _ = locale.getlocale()
             if system_locale_code:
                 # Извлекаем только языковой код (например, 'ru' из 'ru_RU')
                 base_lang = system_locale_code.split('_')[0].lower()  # Приводим к нижнему регистру
@@ -480,12 +480,16 @@ class InstallationService:
 
     def run_installation(self):
         try:
+
             if self._check_for_existing_installation():
                 self.request_confirmation()
                 if not self.confirmation_queue.get():
                     self.log(self.l10n.get("log-installation-canceled-by-user"))  # Локализовано
                     return
                 self._cleanup_previous_installation()
+
+            self.log(self.l10n.get("log-stage-pre-install-check-ports"))
+            self._check_for_port_conflicts()
 
             self.log(self.l10n.get("log-stage-1-server-prep"))  # Локализовано
             self._setup_server()
@@ -543,6 +547,84 @@ class InstallationService:
                                use_sudo=self.l10n.get("yes") if use_sudo else self.l10n.get("no")))  # Локализовано
         self._execute(f"chmod +x {script_path}", working_dir=remote_path)
         self._execute(script_path, use_sudo=use_sudo, working_dir=remote_path)
+
+    def _check_for_port_conflicts(self):
+        """
+        Проверяет, не заняты ли порты из диапазона Portmaster или его сервисный порт
+        любыми процессами на хосте с помощью `ss -tulnp`.
+        Вызывает исключение RuntimeError при обнаружении конфликтов.
+        """
+        self.log(self.l10n.get("log-check-port-range-conflicts"))
+
+        try:
+            pm_start, pm_end = map(int, self.pm_range.split('-'))
+            if not (1 <= pm_start <= 65535 and 1 <= pm_end <= 65535 and pm_start <= pm_end):
+                raise ValueError(self.l10n.get("error-invalid-port-range-values"))
+        except ValueError:
+            raise ValueError(self.l10n.get("error-invalid-port-range-format"))
+
+        # Выполняем команду ss
+        # -A inet: только IPv4 сокеты (чтобы упростить парсинг и не путаться с IPv6 [::]:PORT)
+        # -tulnp: TCP/UDP, listening, numeric, process info
+        # 2>/dev/null: подавляем ошибки на stderr, если ss не найден или нет прав (хотя sudo должен их дать)
+        ss_command = "sudo ss -A inet -tulnp 2>/dev/null"
+
+        try:
+            ss_output = self._execute(ss_command, use_sudo=True)
+        except ChildProcessError as e:
+            # Если команда ss не выполнилась, это критическая проблема.
+            # Нам нужно убедиться, что ss доступен.
+            self.log(self.l10n.get("log-ss-command-error", error=str(e)))
+            raise RuntimeError(self.l10n.get("error-cannot-check-ports", error=str(e)))
+
+        self.log(self.l10n.get("log-analyzing-network-ports"))
+
+        ports_dict = {}
+        for line in ss_output.strip().splitlines():
+            tokens = line.split()
+            if len(tokens) >= 7:
+                # Extract port
+                local = tokens[4]
+                port_str = local.split(':')[-1].strip('[]')
+                try:
+                    port = int(port_str)
+                except ValueError:
+                    continue
+
+                # Extract process name (first in the users:(("name",pid...))
+                match = re.search(r'users:\(\("([^"]+)",', line)
+                process = match.group(1) if match else None
+
+                # Append to dict
+                if port not in ports_dict:
+                    ports_dict[port] = []
+                if process:
+                    ports_dict[port].append(process)
+        conflicting_ports_details = []  # Список для сообщений о конфликтах
+
+        if int(self.pm_port) in ports_dict.keys():
+            processes = ", ".join(sorted(set(ports_dict[int(self.pm_port)])))
+            conflicting_ports_details.append(
+                self.l10n.get("port-conflict-single-port-detail", port=self.pm_port, processes=processes)
+            )
+
+        for occupied_port, processes_list in ports_dict.items():
+            # Если это тот же порт, что и сервисный, и мы его уже обработали, пропускаем
+            if pm_start <= occupied_port <= pm_end:
+                processes = ", ".join(sorted(set(processes_list)))  # Уникальные имена процессов, отсортированные
+                conflicting_ports_details.append(
+                    self.l10n.get("port-conflict-range-port-detail", pm_range=self.pm_range,  port=occupied_port, processes=processes)
+                )
+
+        # Если найдены конфликты, выбрасываем исключение
+        if conflicting_ports_details:
+            all_conflicts_str = "\n".join(conflicting_ports_details)
+            raise RuntimeError(self.l10n.get("error-ports-occupied-by-other-processes",
+                                             conflicts=all_conflicts_str))
+
+        # Если конфликтов нет
+        self.log(self.l10n.get("log-all-required-ports-free"))
+        self.log(self.l10n.get("log-port-conflict-check-complete"))
 
     def run_fix_routes(self):
         """Запускает процесс повторного применения сетевых правил."""

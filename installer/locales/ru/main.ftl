@@ -129,3 +129,13 @@ log-connecting-to = Подключение к { $user }@{ $host }:{ $port }...
 log-connection-successful = ✅ Подключение успешно установлено!
 log-requesting-delete-confirmation = Требуется подтверждение на удаление...
 log-delete-operation-canceled = Операция удаления отменена пользователем.
+log-stage-pre-install-check-ports = Этап 0: Проверка на конфликты портов...
+log-ss-command-error = Ошибка выполнения команды `ss`: { $error }. Утилита не найдена или нет прав.
+log-analyzing-network-ports = Анализируем прослушиваемые сетевые порты...
+port-conflict-single-port-detail = Порт сервиса Portmaster { $port } занят процессами: { $processes }
+port-conflict-range-port-detail = Порт { $port } (из диапазона { $pm_range }) занят процессами: { $processes }
+error-ports-occupied-by-other-processes = ❌ Критическая ошибка: Следующие порты, необходимые Portmaster, заняты другими процессами на хосте:
+                                            { $conflicts }
+                                            Пожалуйста, освободите эти порты или измените настройки Portmaster.
+log-all-required-ports-free = ✅ Все необходимые порты свободны.
+unknown-process = неизвестный процесс

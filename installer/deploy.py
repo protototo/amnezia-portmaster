@@ -61,7 +61,7 @@ def main():
     except KeyboardInterrupt:
         print("\nУстановка прервана пользователем.")
     except Exception as e:
-        print(f"Критическая ошибка при запуске установщика: {e}")
+        print(f"Критическая ошибкaа при запуске установщика: {e}")
 
 
 if __name__ == "__main__":

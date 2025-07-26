@@ -143,3 +143,9 @@ error-ports-occupied-by-other-processes = ❌ Critical Error: The following port
                                             Please free up these ports or change the Portmaster settings.
 log-all-required-ports-free = ✅ All required ports are free.
 unknown-process = unknown process
+
+log-generating-api-key = Generating new API key for Portmaster...
+log-saving-client-config = Saving Portmaster client configuration locally...
+log-creating-local-config-dir = Creating config directory: { $path }
+log-client-config-saved = Client configuration saved to: { $path }
+log-error-saving-client-config = Error saving client configuration: { $error }

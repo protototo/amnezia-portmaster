@@ -7,9 +7,13 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.116.1",
     "flet[all]==0.28.2",
     "fluent-runtime>=0.4.0",
     "paramiko",
+    "pydantic>=2.11.7",
+    "pydantic-settings>=2.10.1",
+    "uvicorn>=0.35.0",
 ]
 
 [project.optional-dependencies]

@@ -10,6 +10,7 @@ import paramiko
 import os
 import locale  # <-- НОВЫЙ ИМПОРТ: для определения системной локали
 from fluent.runtime import FluentLocalization, FluentResourceLoader
+import secrets
 
 # --- КОНФИГУРАЦИЯ ---
 GIT_REPO_URL = "https://github.com/protototo/amnezia-portmaster.git"
@@ -295,6 +296,7 @@ class InstallationService:
         self.confirmed_sudo_password = None
         self.pm_port = user_data.get('pm_port')
         self.pm_range = user_data.get('pm_range')
+        self.admin_api_key = user_data.get('admin_api_key')
         self.amn0_ip = None  # Будет определен во время установки
         self.l10n = l10n  # Инжектируем L10nManager
 
@@ -456,6 +458,7 @@ class InstallationService:
             f"-e 's/^      - PORTMASTER_IP=.*/      - PORTMASTER_IP={ip}/' "
             f"-e 's/^      - PORTMASTER_PORT=.*/      - PORTMASTER_PORT={self.pm_port}/' "
             f"-e 's/^      - EXPOSED_PORT_RANGE=.*/      - EXPOSED_PORT_RANGE={self.pm_range}/' "
+            f"-e 's|^      - PORTMASTER_ADMIN_API_KEY=.*|      - PORTMASTER_ADMIN_API_KEY={self.admin_api_key}|' "
             f"{compose_path}"
         )
 
@@ -509,6 +512,8 @@ class InstallationService:
 
             self._ensure_port_is_open()
             self.log(self.l10n.get("log-network-accessibility-confirmed"))  # Локализовано
+
+            self._save_client_config_locally()
 
             self.log(self.l10n.get("log-installation-success"))  # Локализовано
             self.log(self.l10n.get("log-installation-summary"))  # Локализовано
@@ -626,6 +631,36 @@ class InstallationService:
         self.log(self.l10n.get("log-all-required-ports-free"))
         self.log(self.l10n.get("log-port-conflict-check-complete"))
 
+    def _save_client_config_locally(self):
+        """
+        Сохраняет конфигурацию клиента Portmaster на локальной машине.
+        """
+        self.log(self.l10n.get("log-saving-client-config"))
+
+        try:
+            home_dir = pathlib.Path.home()
+            config_dir = home_dir / "amnezia-portmaster" / "conf"
+            config_path = config_dir / "portmaster-client.conf"
+
+            # Создаем директории, если они не существуют
+            self.log(self.l10n.get("log-creating-local-config-dir", path=str(config_dir)))
+            config_dir.mkdir(parents=True, exist_ok=True)
+
+            config_content = (
+                f"PORTMASTER_IP={self.amn0_ip}\n"
+                f"PORTMASTER_PORT={self.pm_port}\n"
+                f"PORTS=[]\n"
+                f"PORTMASTER_ADMIN_API_KEY={self.admin_api_key}\n"
+            )
+
+            with open(config_path, "w") as f:
+                f.write(config_content)
+
+            self.log(self.l10n.get("log-client-config-saved", path=str(config_path)))
+        except Exception as e:
+            self.log(self.l10n.get("log-error-saving-client-config", error=str(e)))
+
+
     def run_fix_routes(self):
         """Запускает процесс повторного применения сетевых правил."""
         self.log(self.l10n.get("log-start-fix-routes"))  # Локализовано
@@ -731,6 +766,8 @@ class InstallerApp:
         )
         self.pm_pool_start = ft.TextField(label=self.l10n.get("label-pool-start"), value="20000", expand=True)
         self.pm_pool_end = ft.TextField(label=self.l10n.get("label-pool-end"), value="21000", expand=True)
+        self.admin_api_key = ft.TextField(label=self.l10n.get("label-admin-api-key"), password=True,
+                                          can_reveal_password=True, value="", expand=True)
 
         # Выпадающий список для выбора языка
         # Опции теперь создаются с флагами
@@ -1032,13 +1069,16 @@ class InstallerApp:
                 key_filename=self.key_path.value or None,
                 key_password=self.key_password.value or None
             )
-            self._log(self.l10n.get("log-connection-successful"))  # Локализовано
+            self._log(self.l10n.get("log-connection-successful"))
+            admin_api_key = secrets.token_hex(32) # Генерируем 64-символьный шестнадцатеричный ключ
+            self._log(self.l10n.get("log-generating-api-key"))
 
             user_data = {
                 'user': self.user.value.strip(),
                 'password': self.password.value,
                 'pm_port': self.pm_service_port.value,
-                'pm_range': f"{self.pm_pool_start.value}-{self.pm_pool_end.value}"
+                'pm_range': f"{self.pm_pool_start.value}-{self.pm_pool_end.value}",
+                 'admin_api_key': admin_api_key
             }
 
             # Передаем self.l10n в InstallationService

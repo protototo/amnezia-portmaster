@@ -149,3 +149,16 @@ log-saving-client-config = Saving Portmaster client configuration locally...
 log-creating-local-config-dir = Creating config directory: { $path }
 log-client-config-saved = Client configuration saved to: { $path }
 log-error-saving-client-config = Error saving client configuration: { $error }
+
+log-waiting-for-container-startup = Waiting for container { $container_name } to start. Attempts: { $attempts }, interval: { $interval } sec.
+log-container-is-up = Container { $container_name } is up and running.
+log-container-not-running = Container { $container_name } is not yet running. Attempt { $attempt_num } of { $total_attempts }.
+log-error-checking-container-status = Error checking container { $container_name } status: { $error }
+log-unexpected-error-checking-container-status = Unexpected error checking container status: { $error }
+log-container-startup-timeout = Timeout reached waiting for container { $container_name } to start.
+error-container-did-not-start = Container { $container_name } did not start within the allotted time. Installation aborted.
+log-attempting-port-connection-retries = Attempting to connect to port { $port } with { $attempts } retries, { $interval } sec interval.
+log-port-unavailable-retry = Port { $port } is unavailable. Attempt { $attempt_num }. Error: { $error }
+log-port-unavailable-after-retries = Port { $port } still unavailable after retries. Checking UFW...
+log-port-recheck-unavailable-retry = Port { $port } still unavailable after re-check. Attempt { $attempt_num }. Error: { $error }
+error-message-port-not-open-after-ufw = Port did not open even after applying UFW rules and re-checks.

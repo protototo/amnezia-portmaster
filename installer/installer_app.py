@@ -3,6 +3,7 @@ import pwd
 import queue
 import re
 import threading
+import time
 from typing import Callable, Container
 import socket
 import flet as ft
@@ -380,38 +381,73 @@ class InstallationService:
         self._cleanup_ufw_rules()
 
     def _ensure_port_is_open(self):
-        """Проверяет доступность порта с клиента и открывает его в UFW при необходимости."""
-        self.log(self.l10n.get("log-check-port-accessibility", port=self.pm_port))  # Локализовано
+        """
+        Проверяет доступность порта с клиента и открывает его в UFW при необходимости.
+        Теперь включает ожидание запуска контейнера и ретраи для проверки порта.
+        """
+        self.log(self.l10n.get("log-check-port-accessibility", port=self.pm_port))
 
-        self.log(self.l10n.get("log-attempt-connect", ip=self.amn0_ip, port=self.pm_port))  # Локализовано
-        try:
-            with socket.create_connection((self.amn0_ip, self.pm_port), timeout=5):
-                self.log(self.l10n.get("log-port-already-open", port=self.pm_port))  # Локализовано
-                return
-        except (socket.timeout, ConnectionRefusedError, OSError) as e:
-            self.log(self.l10n.get("log-port-unavailable", port=self.pm_port, error=str(e)))  # Локализовано
+        # --- НОВАЯ ЛОГИКА: Сначала убеждаемся, что контейнер поднят ---
+        if not self._wait_for_container_up(CONTAINER_NAME, attempts=10, interval=6):
+            raise RuntimeError(self.l10n.get("error-container-did-not-start", container_name=CONTAINER_NAME))
 
-        try:
-            ufw_status_output = self._execute("sudo ufw status", use_sudo=True)
-            if "Status: inactive" in ufw_status_output:
+        self.log(self.l10n.get("log-attempting-port-connection-retries", port=self.pm_port, attempts=2, interval=3))
+        # Теперь, с повторными попытками, пробуем подключиться к порту
+        port_open = False
+        for i in range(2):  # 10 попыток для подключения к порту
+            try:
+                self.log(self.l10n.get("log-attempt-connect", ip=self.amn0_ip, port=self.pm_port, attempt_num=i + 1,
+                                       total_attempts=10))
+                with socket.create_connection((self.amn0_ip, int(self.pm_port)), timeout=5):
+                    self.log(self.l10n.get("log-port-now-open", port=self.pm_port))
+                    port_open = True
+                    break  # Порт открыт, выходим из цикла ретраев
+            except (socket.timeout, ConnectionRefusedError, OSError) as e:
+                self.log(
+                    self.l10n.get("log-port-unavailable-retry", port=self.pm_port, error=str(e), attempt_num=i + 1))
+                if i < 9:  # Не засыпаем после последней попытки
+                    time.sleep(3)  # Ждем 3 секунды перед следующей попыткой
+
+        if not port_open:
+            # Если порт все еще не открыт после ретраев, проверяем/добавляем правила UFW
+            self.log(self.l10n.get("log-port-unavailable-after-retries", port=self.pm_port))
+
+            try:
+                ufw_status_output = self._execute("sudo ufw status", use_sudo=True)
+                if "Status: inactive" in ufw_status_output:
+                    raise RuntimeError(
+                        self.l10n.get("error-port-unavailable-ufw-inactive", port=self.pm_port)
+                    )
+            except ChildProcessError:
+                raise RuntimeError(self.l10n.get("error-port-unavailable-ufw-not-found", port=self.pm_port))
+
+            self.log(self.l10n.get("log-ufw-active-adding-rule"))
+            self._execute(f"sudo ufw allow {self.pm_port}/tcp comment '{UFW_RULE_COMMENT}'", use_sudo=True)
+            self.log(self.l10n.get("log-rule-added-to-ufw", port=self.pm_port))
+
+            # Повторно проверяем доступность порта после добавления правила UFW, также с ретраями
+            self.log(self.l10n.get("log-recheck-port-accessibility", ip=self.amn0_ip, port=self.pm_port))
+            recheck_port_open = False
+            for i in range(10):  # 10 попыток для повторной проверки
+                try:
+                    with socket.create_connection((self.amn0_ip, int(self.pm_port)), timeout=5):
+                        self.log(self.l10n.get("log-port-now-open", port=self.pm_port))
+                        recheck_port_open = True
+                        break
+                except (socket.timeout, ConnectionRefusedError, OSError) as e:
+                    self.log(self.l10n.get("log-port-recheck-unavailable-retry", port=self.pm_port, error=str(e),
+                                           attempt_num=i + 1))
+                    if i < 9:
+                        time.sleep(3)
+
+            if not recheck_port_open:
                 raise RuntimeError(
-                    self.l10n.get("error-port-unavailable-ufw-inactive", port=self.pm_port)  # Локализовано
+                    self.l10n.get("error-port-still-unavailable", port=self.pm_port,
+                                  error=self.l10n.get("error-message-port-not-open-after-ufw"))
                 )
-        except ChildProcessError:
-            raise RuntimeError(self.l10n.get("error-port-unavailable-ufw-not-found", port=self.pm_port))  # Локализовано
-
-        self.log(self.l10n.get("log-ufw-active-adding-rule"))  # Локализовано
-        self._execute(f"sudo ufw allow {self.pm_port}/tcp comment '{UFW_RULE_COMMENT}'", use_sudo=True)
-        self.log(self.l10n.get("log-rule-added-to-ufw", port=self.pm_port))  # Локализовано
-
-        self.log(self.l10n.get("log-recheck-port-accessibility", ip=self.amn0_ip, port=self.pm_port))  # Локализовано
-        try:
-            with socket.create_connection((self.amn0_ip, self.pm_port), timeout=5):
-                self.log(self.l10n.get("log-port-now-open", port=self.pm_port))  # Локализовано
-        except (socket.timeout, ConnectionRefusedError, OSError) as e:
-            raise RuntimeError(
-                self.l10n.get("error-port-still-unavailable", port=self.pm_port, error=str(e))  # Локализовано
-            )
+        else:
+            self.log(self.l10n.get("log-port-now-open",
+                                   port=self.pm_port))  # Это уже было залогировано, если port_open = True
 
     def _obtain_sudo_password(self):
         """
@@ -509,11 +545,9 @@ class InstallationService:
             self.log(self.l10n.get("log-stage-4-apply-net-rules"))  # Локализовано
             self._apply_network_rules()
             self.log(self.l10n.get("log-net-rules-applied"))  # Локализовано
-
+            self._save_client_config_locally()
             self._ensure_port_is_open()
             self.log(self.l10n.get("log-network-accessibility-confirmed"))  # Локализовано
-
-            self._save_client_config_locally()
 
             self.log(self.l10n.get("log-installation-success"))  # Локализовано
             self.log(self.l10n.get("log-installation-summary"))  # Локализовано
@@ -660,7 +694,6 @@ class InstallationService:
         except Exception as e:
             self.log(self.l10n.get("log-error-saving-client-config", error=str(e)))
 
-
     def run_fix_routes(self):
         """Запускает процесс повторного применения сетевых правил."""
         self.log(self.l10n.get("log-start-fix-routes"))  # Локализовано
@@ -670,6 +703,39 @@ class InstallationService:
         except Exception as e:
             self.log(
                 self.l10n.get("log-error-during-fix-routes", error_type=type(e).__name__, error=str(e)))  # Локализовано
+
+    def _wait_for_container_up(self, container_name: str, attempts: int = 10, interval: int = 3) -> bool:
+        """
+        Ожидает, пока указанный Docker-контейнер не перейдет в статус 'Up'.
+        Использует паттерн Retry Logic.
+        """
+        self.log(self.l10n.get("log-waiting-for-container-startup", container_name=container_name, attempts=attempts, interval=interval))
+        use_sudo = self.data['user'] != 'root'
+
+        for i in range(attempts):
+            try:
+                # Проверяем статус контейнера
+                # Использование `status=running` более надежно, чем парсинг "Up X seconds"
+                command = f"docker ps -f name={container_name} --filter 'status=running' --format '{{{{.Names}}}}'"
+                running_containers = self._execute(command, use_sudo=use_sudo).strip()
+
+                if running_containers == container_name:
+                    self.log(self.l10n.get("log-container-is-up", container_name=container_name))
+                    return True
+                else:
+                    self.log(self.l10n.get("log-container-not-running", container_name=container_name, attempt_num=i+1, total_attempts=attempts))
+
+            except ChildProcessError as e:
+                # Это может произойти, если Docker-демон еще не запущен или команда `docker` не найдена
+                self.log(self.l10n.get("log-error-checking-container-status", error=str(e), container_name=container_name))
+            except Exception as e:
+                self.log(self.l10n.get("log-unexpected-error-checking-container-status", error=str(e)))
+
+            if i < attempts - 1:
+                time.sleep(interval)
+
+        self.log(self.l10n.get("log-container-startup-timeout", container_name=container_name))
+        return False
 
 
 # --- Главное приложение (UI) ---

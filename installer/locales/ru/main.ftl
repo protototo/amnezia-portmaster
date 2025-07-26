@@ -50,6 +50,7 @@ validation-error-password-key = ❌ Ошибка: Укажите пароль п
 validation-error-ports-numeric = ❌ Ошибка: Порты и диапазон пула Portmaster должны быть числами.
 validation-error-port-too-low = ❌ Ошибка: Порт Portmaster должен быть больше 1080.
 validation-error-invalid-range = ❌ Ошибка: Введите корректный диапазон портов
+label-language-dropdown = Язык
 
 # Сообщения для лога
 log-prefix-success = ✅

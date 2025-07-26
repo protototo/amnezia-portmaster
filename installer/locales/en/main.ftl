@@ -50,6 +50,7 @@ validation-error-password-key = ❌ Error: Specify user password or select SSH k
 validation-error-ports-numeric = ❌ Error: Portmaster ports and pool range must be numbers.
 validation-error-port-too-low = ❌ Error: Portmaster port must be greater than 1080.
 validation-error-invalid-range = ❌ Error: Enter a valid port range.
+label-language-dropdown = Language
 
 # Log messages
 log-prefix-success = ✅
